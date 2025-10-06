@@ -1,7 +1,7 @@
 <launch>
   <arg name="sensor_number" default="450" />
 
-  <arg name="port_ip_address" default="192.168.2.94" />
+  <arg name="port_ip_address" default="192.168.2.93" />
   <arg name="port_port" default="51200" />
   <arg name="starboard_ip_address" default="192.168.2.95" />
   <arg name="starboard_port" default="51200" />

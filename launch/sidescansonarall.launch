@@ -1,0 +1,42 @@
+<launch>
+  <arg name="sensor_number" default="450" />
+
+  <arg name="port_ip_address" default="192.168.2.94" /> 
+  <arg name="port_port" default="51200" />
+  <arg name="starboard_ip_address" default="192.168.2.95" />
+  <arg name="starboard_port" default="51200" />
+  <arg name="bow_ip_address" default="192.168.2.93" />
+  <arg name="bow_port" default="51200" />
+  <arg name="stern_ip_address" default="192.168.2.92" />
+  <arg name="stern_port" default="51200" />
+
+
+  <arg name="speed_of_sound_mm" default="1482000" />
+  <arg name="start_mm" default="0" />
+  <arg name="length_mm" default="6000" />
+  <arg name="msec_per_ping" default="1" />
+  <arg name="pulse_len_percent" default="0.002" />
+  <arg name="filter_duration_percent" default="0.0015" />
+  <arg name="gain_index" default="-1" />
+  <arg name="num_results" default="600" />
+
+  <node pkg="omniscan_sidescan" type="sidescansonarall_node.py" name="omniscan$(arg sensor_number)all" respawn="true" respawn_delay="30" output="screen" >
+    <param name="sensor_number" value="$(arg sensor_number)" />
+    <param name="port_ip_address" value="$(arg port_ip_address)" />
+    <param name="port_port" value="$(arg port_port)" />
+    <param name="starboard_ip_address" value="$(arg starboard_ip_address)" />
+    <param name="starboard_port" value="$(arg starboard_port)" />
+    <param name="bow_ip_address" value="$(arg bow_ip_address)" />
+    <param name="bow_port" value="$(arg bow_port)" />
+    <param name="stern_ip_address" value="$(arg stern_ip_address)" />
+    <param name="stern_port" value="$(arg stern_port)" />
+    <param name="speed_of_sound_mm" value="$(arg speed_of_sound_mm)" />
+    <param name="start_mm" value="$(arg start_mm)" />
+    <param name="length_mm" value="$(arg length_mm)" />
+    <param name="msec_per_ping" value="$(arg msec_per_ping)" />
+    <param name="pulse_len_percent" value="$(arg pulse_len_percent)" />
+    <param name="filter_duration_percent" value="$(arg filter_duration_percent)" />
+    <param name="gain_index" value="$(arg gain_index)" />
+    <param name="num_results" value="$(arg num_results)" />
+  </node>
+</launch>

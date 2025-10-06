@@ -27,9 +27,13 @@ Connect to the BlueOS.
 
 ***Adjust the ip address for each sonar in the launch file.***
 
-Run omniscan_sonar:
+Run omniscan_sonar for one pair of sonars:
 
-```roslaunch roslaunch omniscan_sidescan sidescansonar.launch```
+```roslaunch omniscan_sidescan sidescansonar.launch```
+
+Run omniscan_sonar for two pairs of sonars:
+
+```roslaunch omniscan_sidescan sidescansonarall.launch```
 
 ### Output
 

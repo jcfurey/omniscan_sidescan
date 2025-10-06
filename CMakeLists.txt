@@ -24,6 +24,8 @@ catkin_python_setup()
    FILES
    SideScanSonarRaw.msg
    SideScanSonar.msg
+   SideScanSonarAllRaw.msg
+   SideScanSonarAll.msg
  )
 
 
@@ -83,6 +85,10 @@ include_directories(
 # See http://ros.org/doc/api/catkin/html/adv_user_guide/variables.html
 
 install(PROGRAMS scripts/sidescansonar_node.py
+   DESTINATION ${CATKIN_PACKAGE_BIN_DESTINATION}
+)
+
+install(PROGRAMS scripts/sidescansonarall_node.py
    DESTINATION ${CATKIN_PACKAGE_BIN_DESTINATION}
 )
 
