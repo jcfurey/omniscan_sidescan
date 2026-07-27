@@ -1,2 +1,9 @@
 **__pychace__
+__pycache__/
 *.pyc
+
+# colcon / ament build artifacts
+build/
+install/
+log/
+*.egg-info/

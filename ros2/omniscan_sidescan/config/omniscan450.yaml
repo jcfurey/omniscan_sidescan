@@ -1,0 +1,37 @@
+# Parameters for the Omniscan 450 side scan sonar nodes.
+#
+# Load with:
+#   ros2 run omniscan_sidescan sidescansonarall_node \
+#     --ros-args --params-file <this file>
+#
+# The node name key has to match the node's name, which the launch files set
+# from sensor_number: omniscan450 for the two-sonar node, omniscan450all for
+# the four-sonar node.  Use /** to apply to whichever one is running.
+/**:
+  ros__parameters:
+    # Addresses of the sonars on the vehicle network.  Read-only: change them
+    # here or on the command line, not at run time.
+    port_ip_address: "192.168.2.94"
+    port_port: 51200
+    starboard_ip_address: "192.168.2.95"
+    starboard_port: 51200
+    # Only used by the four-sonar node.
+    bow_ip_address: "192.168.2.93"
+    bow_port: 51200
+    stern_ip_address: "192.168.2.92"
+    stern_port: 51200
+
+    frame_id: "sonar"
+    # Seconds to wait for a profile from each sonar before reporting a miss.
+    read_timeout: 0.5
+
+    # Tunables; these can be changed while the node runs with
+    # `ros2 param set`, and apply to every sonar the node owns.
+    speed_of_sound_mm: 1482000    # 1482000 - 1500000
+    start_mm: 0                   # 0 - 5000
+    length_mm: 6000               # 0 - 300000
+    msec_per_ping: 0              # 0 - 10, 0 for the best ping rate
+    pulse_len_percent: 0.002      # 0.002 - 0.004
+    filter_duration_percent: 0.0015   # 0.0015 - 0.0016
+    gain_index: -1                # -1 for auto gain, otherwise 0 - 7
+    num_results: 600              # 200 - 1200
