@@ -1,0 +1,8 @@
+#!/usr/bin/env python3
+"""ROS executable wrapper for the Omniscan 450 simulator."""
+
+from omniscan_sidescan.omniscan450_simulator import main
+
+
+if __name__ == '__main__':
+    main()

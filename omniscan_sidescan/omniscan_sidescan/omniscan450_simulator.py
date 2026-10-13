@@ -59,6 +59,8 @@ class Omniscan450Simulator(object):
         self.start_mm = 0
         self.length_mm = 5000
         self.msec_per_ping = 0
+        self.pulse_len_percent = 0.002
+        self.filter_duration_percent = 0.0015
         self.gain_index = -1
         self.num_results = 600
         self.speed_of_sound_mm = 1482000
@@ -122,7 +124,7 @@ class Omniscan450Simulator(object):
         """Serve a single client until it disconnects or we are stopped."""
         connection.setblocking(False)
         parser = PingParser()
-        next_ping = time.time()
+        next_ping = time.monotonic()
 
         while self._running.is_set():
             try:
@@ -137,9 +139,11 @@ class Omniscan450Simulator(object):
             except OSError:
                 return
 
-            now = time.time()
+            now = time.monotonic()
             if self.enabled and now >= next_ping:
-                next_ping = now + self.ping_interval
+                configured_interval = self.msec_per_ping / 1000.0
+                next_ping = now + max(
+                    self.ping_interval, configured_interval)
                 try:
                     connection.sendall(self._build_profile())
                 except OSError:
@@ -155,6 +159,8 @@ class Omniscan450Simulator(object):
             self.start_mm = msg.start_mm
             self.length_mm = msg.length_mm
             self.msec_per_ping = msg.msec_per_ping
+            self.pulse_len_percent = msg.pulse_len_percent
+            self.filter_duration_percent = msg.filter_duration_percent
             self.gain_index = msg.gain_index
             self.num_results = msg.num_results
             self.enabled = bool(msg.enable)

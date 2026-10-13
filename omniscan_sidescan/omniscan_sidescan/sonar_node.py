@@ -10,8 +10,6 @@ hand.
 Originally authored for ROS 1 by Monika Roznere (Binghamton University).
 """
 
-from array import array
-
 from rcl_interfaces.msg import (
     FloatingPointRange,
     IntegerRange,
@@ -20,8 +18,15 @@ from rcl_interfaces.msg import (
 )
 import rclpy
 from rclpy.node import Node
+from rclpy.qos import qos_profile_sensor_data
 
-from .omniscan450_driver import Omniscan450Driver, SonarError, SonarParams
+from .omniscan450_driver import (
+    Omniscan450Driver,
+    PARAMETER_LIMITS,
+    SonarConnectionError,
+    SonarError,
+    SonarParams,
+)
 
 # Topic naming, kept identical to the ROS 1 package.
 SENSOR_NAME = 'omniscan'
@@ -32,6 +37,8 @@ DEFAULT_SENSOR_NUMBER = 450
 DEFAULT_SONAR_PORT = 51200
 DEFAULT_FRAME_ID = 'sonar'
 DEFAULT_READ_TIMEOUT = 0.5
+DEFAULT_CONNECT_TIMEOUT = 5.0
+DEFAULT_MAX_CONSECUTIVE_FAILURES = 10
 
 # Profile fields that are recorded once per sonar.
 PER_CHANNEL_FIELDS = (
@@ -58,25 +65,35 @@ SHARED_FIELDS = (
     'vehicle_heading_deg',
 )
 
+# If these fields disagree, combining the channels into one message would
+# attach incorrect range metadata to at least one power array.  This can occur
+# briefly while a newly applied configuration works through device buffers.
+CONSISTENT_FIELDS = (
+    'start_mm',
+    'length_mm',
+    'num_results',
+    'sos_dmps',
+)
+
 # Tunable parameters, mirroring the ROS 1 cfg/Omniscan450.cfg.  Each entry is
-# (name, default, minimum, maximum, description); ints and floats are told
-# apart by the type of the default.
+# (name, default, description); limits come from the transport-independent
+# SonarParams model so direct users and ROS users cannot drift apart.
 TUNABLE_PARAMETERS = (
-    ('speed_of_sound_mm', 1482000, 1482000, 1500000,
+    ('speed_of_sound_mm', 1482000,
      'speed of sound in water, in mm/s'),
-    ('start_mm', 0, 0, 5000,
+    ('start_mm', 0,
      'start of ping range, in mm'),
-    ('length_mm', 5000, 0, 300000,
+    ('length_mm', 5000,
      'length of returned profile; end of region = start_mm + length_mm'),
-    ('msec_per_ping', 0, 0, 10,
+    ('msec_per_ping', 0,
      'set to limit the ping rate; 0 for the best ping rate'),
-    ('pulse_len_percent', 0.002, 0.002, 0.004,
+    ('pulse_len_percent', 0.002,
      '%% of total ping time for the current range'),
-    ('filter_duration_percent', 0.0015, 0.0015, 0.0016,
+    ('filter_duration_percent', 0.0015,
      'typically 0.0015'),
-    ('gain_index', -1, -1, 7,
+    ('gain_index', -1,
      '-1 for auto gain, otherwise 0-7 sets the gain'),
-    ('num_results', 600, 200, 1200,
+    ('num_results', 600,
      'number of signal data points in the returned profile'),
 )
 
@@ -97,21 +114,28 @@ class SideScanSonarNode(Node):
     #: Message type carrying the raw u16 profiles.
     SONAR_RAW_MSG = None
 
-    def __init__(self, node_name):
-        super().__init__(node_name)
+    def __init__(self, node_name, **kwargs):
+        super().__init__(node_name, **kwargs)
 
         self._declare_parameters()
 
         sensor_number = self.get_parameter('sensor_number').value
         self._frame_id = self.get_parameter('frame_id').value
         self._read_timeout = self.get_parameter('read_timeout').value
+        connect_timeout = self.get_parameter('connect_timeout').value
+        self._max_consecutive_failures = self.get_parameter(
+            'max_consecutive_failures').value
+
+        if not self._frame_id:
+            raise ValueError('frame_id must not be empty')
 
         sensor_name = '%s%d' % (SENSOR_NAME, sensor_number)
         self.range_raw_pub = self.create_publisher(
             self.SONAR_RAW_MSG, '%s/%s' % (sensor_name, SONAR_RAW_TOPIC_NAME),
-            10)
+            qos_profile_sensor_data)
         self.range_pub = self.create_publisher(
-            self.SONAR_MSG, '%s/%s' % (sensor_name, SONAR_TOPIC_NAME), 10)
+            self.SONAR_MSG, '%s/%s' % (sensor_name, SONAR_TOPIC_NAME),
+            qos_profile_sensor_data)
 
         params = self._current_sonar_params()
 
@@ -126,7 +150,8 @@ class SideScanSonarNode(Node):
                     'Connecting to %s sonar at %s:%d' % (channel, ip_address, port))
                 self.sonars[channel] = Omniscan450Driver(
                     ip_address=ip_address, port=port, params=params,
-                    name=channel, logger=self.get_logger())
+                    name=channel, logger=self.get_logger(),
+                    connect_timeout=connect_timeout)
         except SonarError:
             self.close_sonars()
             raise
@@ -135,7 +160,9 @@ class SideScanSonarNode(Node):
         # replacement for the ROS 1 dynamic_reconfigure server.
         self.add_on_set_parameters_callback(self._on_set_parameters)
 
-        self._reported_read_failure = False
+        self._failed_channels = set()
+        self._failure_counts = dict.fromkeys(self.CHANNELS, 0)
+        self._reported_inconsistent_profiles = False
 
     def _declare_parameters(self):
         """Declare every parameter this node accepts."""
@@ -143,7 +170,9 @@ class SideScanSonarNode(Node):
             'sensor_number', DEFAULT_SENSOR_NUMBER,
             ParameterDescriptor(
                 description='sensor number used in the topic names',
-                read_only=True))
+                read_only=True,
+                integer_range=[IntegerRange(
+                    from_value=0, to_value=65535, step=1)]))
         self.declare_parameter(
             'frame_id', DEFAULT_FRAME_ID,
             ParameterDescriptor(
@@ -151,7 +180,25 @@ class SideScanSonarNode(Node):
         self.declare_parameter(
             'read_timeout', DEFAULT_READ_TIMEOUT,
             ParameterDescriptor(
-                description='seconds to wait for a profile from each sonar'))
+                description='seconds to wait for a profile from each sonar',
+                floating_point_range=[FloatingPointRange(
+                    from_value=0.001, to_value=60.0, step=0.0)]))
+        self.declare_parameter(
+            'connect_timeout', DEFAULT_CONNECT_TIMEOUT,
+            ParameterDescriptor(
+                description='seconds to wait while connecting to each sonar',
+                read_only=True,
+                floating_point_range=[FloatingPointRange(
+                    from_value=0.1, to_value=60.0, step=0.0)]))
+        self.declare_parameter(
+            'max_consecutive_failures', DEFAULT_MAX_CONSECUTIVE_FAILURES,
+            ParameterDescriptor(
+                description=(
+                    'profile failures before exiting for launch respawn; '
+                    'zero disables the threshold'),
+                read_only=True,
+                integer_range=[IntegerRange(
+                    from_value=0, to_value=100000, step=1)]))
 
         for channel in self.CHANNELS:
             self.declare_parameter(
@@ -164,9 +211,12 @@ class SideScanSonarNode(Node):
                 '%s_port' % channel, DEFAULT_SONAR_PORT,
                 ParameterDescriptor(
                     description='TCP port of the %s sonar' % channel,
-                    read_only=True))
+                    read_only=True,
+                    integer_range=[IntegerRange(
+                        from_value=1, to_value=65535, step=1)]))
 
-        for name, default, minimum, maximum, description in TUNABLE_PARAMETERS:
+        for name, default, description in TUNABLE_PARAMETERS:
+            minimum, maximum = PARAMETER_LIMITS[name]
             if isinstance(default, int):
                 descriptor = ParameterDescriptor(
                     description=description,
@@ -203,23 +253,53 @@ class SideScanSonarNode(Node):
         overrides = {p.name: p.value for p in parameters
                      if p.name in tunable_names}
 
+        frame_id = self._frame_id
+        read_timeout = self._read_timeout
         for parameter in parameters:
             if parameter.name == 'frame_id':
-                self._frame_id = parameter.value
+                if not parameter.value:
+                    return SetParametersResult(
+                        successful=False,
+                        reason='frame_id must not be empty')
+                frame_id = parameter.value
             elif parameter.name == 'read_timeout':
-                self._read_timeout = parameter.value
+                read_timeout = parameter.value
 
-        if not overrides:
-            return SetParametersResult(successful=True)
+        if overrides:
+            try:
+                params = self._current_sonar_params(overrides)
+            except (TypeError, ValueError) as exception:
+                return SetParametersResult(
+                    successful=False, reason=str(exception))
 
-        params = self._current_sonar_params(overrides)
-        try:
-            for sonar in self.sonars.values():
-                sonar.set_parameters(params)
-        except (ConnectionError, OSError) as exception:
-            return SetParametersResult(
-                successful=False,
-                reason='failed to send parameters to the sonars: %s' % exception)
+            previous = {
+                channel: sonar.params
+                for channel, sonar in self.sonars.items()
+            }
+            updated = []
+            try:
+                for channel, sonar in self.sonars.items():
+                    sonar.set_parameters(params)
+                    updated.append(channel)
+            except SonarError as exception:
+                rollback_failures = []
+                for channel in updated:
+                    try:
+                        self.sonars[channel].set_parameters(previous[channel])
+                    except SonarError:
+                        rollback_failures.append(channel)
+
+                reason = 'failed to send parameters to the sonars: %s' % exception
+                if rollback_failures:
+                    reason += '; rollback also failed for: %s' % ', '.join(
+                        rollback_failures)
+                return SetParametersResult(successful=False, reason=reason)
+
+        # Commit cached non-device values only after every part of the update
+        # has succeeded.  A rejected atomic parameter update must not leak
+        # into runtime behavior.
+        self._frame_id = frame_id
+        self._read_timeout = read_timeout
 
         return SetParametersResult(successful=True)
 
@@ -228,23 +308,64 @@ class SideScanSonarNode(Node):
 
         Returns True if a set of messages was published.
         """
-        try:
-            readings = {
-                channel: sonar.get_data(timeout=self._read_timeout)
-                for channel, sonar in self.sonars.items()
-            }
-        except SonarError as exception:
-            # Throttle: the sonars drop the occasional profile, and logging
-            # every miss at the ping rate would swamp the log.
-            if not self._reported_read_failure:
+        readings = {}
+        failures = {}
+        connection_failure = None
+        for channel, sonar in self.sonars.items():
+            try:
+                readings[channel] = sonar.get_data(timeout=self._read_timeout)
+                self._failure_counts[channel] = 0
+            except SonarError as exception:
+                failures[channel] = exception
+                self._failure_counts[channel] += 1
+                if isinstance(exception, SonarConnectionError):
+                    connection_failure = exception
+
+        for channel, exception in failures.items():
+            if channel not in self._failed_channels:
                 self.get_logger().error(
-                    'Failed to read Omniscan 450 sonar data: %s' % exception)
-                self._reported_read_failure = True
+                    'Failed to read %s Omniscan 450: %s'
+                    % (channel, exception))
+        for channel in self._failed_channels - failures.keys():
+            self.get_logger().info(
+                '%s Omniscan 450 data recovered' % channel)
+        self._failed_channels = set(failures)
+
+        # A closed/reset socket cannot recover by polling.  Let the launch
+        # action respawn the process and establish a fresh connection.
+        if connection_failure is not None:
+            raise connection_failure
+        if self._max_consecutive_failures:
+            exhausted = [
+                channel for channel in self.CHANNELS
+                if self._failure_counts[channel]
+                >= self._max_consecutive_failures
+            ]
+            if exhausted:
+                raise SonarConnectionError(
+                    'persistent profile failures on %s; restarting the node'
+                    % ', '.join(exhausted))
+        if failures:
             return False
 
-        if self._reported_read_failure:
-            self.get_logger().info('Omniscan 450 sonar data recovered')
-            self._reported_read_failure = False
+        reference = readings[self.CHANNELS[0]][0]
+        mismatched = []
+        for channel in self.CHANNELS[1:]:
+            data = readings[channel][0]
+            if any(getattr(data, field) != getattr(reference, field)
+                   for field in CONSISTENT_FIELDS):
+                mismatched.append(channel)
+
+        if mismatched:
+            if not self._reported_inconsistent_profiles:
+                self.get_logger().warning(
+                    'Dropping profiles with inconsistent scan metadata from: %s'
+                    % ', '.join(mismatched))
+                self._reported_inconsistent_profiles = True
+            return False
+        if self._reported_inconsistent_profiles:
+            self.get_logger().info('Sonar scan metadata is consistent again')
+            self._reported_inconsistent_profiles = False
 
         stamp = self.get_clock().now().to_msg()
 
@@ -256,7 +377,7 @@ class SideScanSonarNode(Node):
             target.header.frame_id = self._frame_id
 
         # Shared fields come from the first channel, as in the ROS 1 nodes.
-        primary_data = readings[self.CHANNELS[0]][0]
+        primary_data = reference
         for field in SHARED_FIELDS:
             value = getattr(primary_data, field)
             setattr(raw_msg, field, value)
@@ -273,9 +394,9 @@ class SideScanSonarNode(Node):
             # array.array lets rclpy take the fast path instead of validating
             # every one of the several hundred elements.
             setattr(raw_msg, '%s_pwr_data' % channel,
-                    array('H', data.pwr_results))
+                    data.pwr_results)
             setattr(msg, '%s_scaled_data' % channel,
-                    array('f', scaled_results))
+                    scaled_results)
 
         self.range_raw_pub.publish(raw_msg)
         self.range_pub.publish(msg)

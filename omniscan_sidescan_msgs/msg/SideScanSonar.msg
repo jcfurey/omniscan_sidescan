@@ -27,5 +27,5 @@ float32 port_transducer_heading_deg
 float32 starboard_transducer_heading_deg
 float32 vehicle_heading_deg
 
-float32[] port_scaled_data
-float32[] starboard_scaled_data
+float32[<=1200] port_scaled_data
+float32[<=1200] starboard_scaled_data

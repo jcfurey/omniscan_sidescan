@@ -1,11 +1,13 @@
 # -*- coding: utf-8 -*-
 """Tests for the sonar driver, run against the simulator."""
 
+from dataclasses import FrozenInstanceError
 import time
 
-from omniscan_sidescan.brping import definitions, Omniscan450
+from omniscan_sidescan.brping import definitions, Omniscan450, PingDevice
 from omniscan_sidescan.omniscan450_driver import (
     Omniscan450Driver,
+    SonarConnectionError,
     SonarError,
     SonarParams,
 )
@@ -92,6 +94,38 @@ def test_scale_power_maps_the_extremes_of_the_range():
     assert scaled[2] == pytest.approx(-45.0, abs=0.01)
 
 
+def test_socket_write_retries_until_the_entire_packet_is_sent():
+    class PartialSocket(object):
+
+        def __init__(self):
+            self.received = bytearray()
+
+        def send(self, data):
+            accepted = min(3, len(data))
+            self.received.extend(data[:accepted])
+            return accepted
+
+    device = PingDevice()
+    device.iodev = PartialSocket()
+    packet = b'BR\x01\x02\x03\x04\x05\x06'
+
+    assert device.write(packet) == len(packet)
+    assert device.iodev.received == packet
+
+
+def test_socket_write_reports_a_closed_connection():
+    class ClosedSocket(object):
+
+        def send(self, data):
+            return 0
+
+    device = PingDevice()
+    device.iodev = ClosedSocket()
+
+    with pytest.raises(ConnectionError):
+        device.write(b'packet')
+
+
 def test_get_data_times_out_when_the_sonar_stops_pinging(driver, simulator):
     driver.get_data(timeout=2.0)
     simulator.enabled = False
@@ -129,6 +163,21 @@ def test_set_parameters_only_resends_what_changed(driver, simulator):
 
     assert wait_for(lambda: simulator.length_mm == 9000)
     assert driver.params.length_mm == 9000
+
+
+def test_failed_parameter_update_does_not_change_driver_state(
+        driver, monkeypatch):
+    previous = driver.params
+
+    def fail_to_write(**kwargs):
+        raise ConnectionError('simulated write failure')
+
+    monkeypatch.setattr(
+        driver.omniscan450, 'control_os_ping_params', fail_to_write)
+
+    with pytest.raises(SonarConnectionError):
+        driver.set_parameters(SonarParams(length_mm=9000))
+    assert driver.params == previous
 
 
 def test_profiles_track_the_requested_result_count(driver, simulator):
@@ -190,6 +239,14 @@ def test_close_connection_disables_pinging(simulator):
     assert wait_for(lambda: simulator.enabled is False)
 
 
+def test_closed_peer_is_reported_as_a_connection_error(driver, simulator):
+    driver.get_data(timeout=2.0)
+    simulator.stop()
+
+    with pytest.raises(SonarConnectionError):
+        driver.get_data(timeout=1.0)
+
+
 def test_sonar_params_field_names_match_the_dataclass():
     names = SonarParams.field_names()
 
@@ -199,3 +256,22 @@ def test_sonar_params_field_names_match_the_dataclass():
         'pulse_len_percent', 'filter_duration_percent', 'gain_index',
         'num_results',
     }
+
+
+@pytest.mark.parametrize('kwargs', [
+    {'speed_of_sound_mm': 1},
+    {'length_mm': 300001},
+    {'gain_index': 8},
+    {'num_results': 199},
+    {'pulse_len_percent': float('nan')},
+])
+def test_sonar_params_reject_out_of_range_values(kwargs):
+    with pytest.raises(ValueError):
+        SonarParams(**kwargs)
+
+
+def test_sonar_params_are_immutable():
+    params = SonarParams()
+
+    with pytest.raises(FrozenInstanceError):
+        params.length_mm = 9000

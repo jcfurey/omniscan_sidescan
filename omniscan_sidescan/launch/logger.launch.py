@@ -6,15 +6,32 @@ default is to record everything, which is what that list amounted to on the
 vehicle; set ``all_topics`` to false and pass ``topics`` to narrow it down.
 """
 
+import shlex
+
 from launch import LaunchDescription
-from launch.actions import DeclareLaunchArgument, ExecuteProcess
+from launch.actions import DeclareLaunchArgument, ExecuteProcess, OpaqueFunction
 from launch.conditions import IfCondition, UnlessCondition
 from launch.substitutions import LaunchConfiguration
 
 
+def _selective_recorder(context):
+    """Build a recorder command with each configured topic as one argument."""
+    topics = shlex.split(LaunchConfiguration('topics').perform(context))
+    if not topics:
+        raise RuntimeError(
+            'topics must contain at least one topic when all_topics is false')
+
+    return [ExecuteProcess(
+        cmd=[
+            'ros2', 'bag', 'record', '--output',
+            LaunchConfiguration('bag_name'), *topics,
+        ],
+        output='screen',
+    )]
+
+
 def generate_launch_description():
     bag_name = LaunchConfiguration('bag_name')
-    topics = LaunchConfiguration('topics')
     all_topics = LaunchConfiguration('all_topics')
 
     return LaunchDescription([
@@ -34,9 +51,7 @@ def generate_launch_description():
             cmd=['ros2', 'bag', 'record', '--all', '--output', bag_name],
             output='screen'),
 
-        ExecuteProcess(
+        OpaqueFunction(
             condition=UnlessCondition(all_topics),
-            cmd=['ros2', 'bag', 'record', '--output', bag_name, topics],
-            output='screen',
-            shell=True),
+            function=_selective_recorder),
     ])

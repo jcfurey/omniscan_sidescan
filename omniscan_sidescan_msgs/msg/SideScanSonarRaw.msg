@@ -27,5 +27,5 @@ float32 port_transducer_heading_deg
 float32 starboard_transducer_heading_deg
 float32 vehicle_heading_deg
 
-uint16[] port_pwr_data
-uint16[] starboard_pwr_data
+uint16[<=1200] port_pwr_data
+uint16[<=1200] starboard_pwr_data

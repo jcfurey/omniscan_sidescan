@@ -13,14 +13,15 @@ and the Python standard library. The parts of
 vendored under `omniscan_sidescan/brping/`, so there is nothing to `pip
 install` and no source checkout to keep in sync.
 
-Built and tested on ROS 2 Jazzy.
+Built and tested on ROS 2 Lyrical. The implementation uses APIs available in
+ROS 2 Jazzy and newer.
 
 ## Packages
 
 | Package | Build type | Contents |
 | --- | --- | --- |
-| `omniscan_sidescan_msgs` | `ament_cmake` | the four message definitions |
-| `omniscan_sidescan` | `ament_python` | driver, nodes, launch files, simulator |
+| `omniscan_sidescan_msgs` | `ament_cmake_auto` | the four message definitions |
+| `omniscan_sidescan` | `ament_cmake_auto` | Python driver, nodes, launch files, simulator |
 
 They are split so the messages can be depended on without pulling in the
 driver, which is the usual ROS 2 arrangement.
@@ -34,7 +35,7 @@ repository root, so colcon finds them directly:
 mkdir -p ~/ros2_ws/src && cd ~/ros2_ws/src
 git clone -b <this branch> <this repository>
 cd ~/ros2_ws
-colcon build
+colcon build --packages-up-to omniscan_sidescan
 source install/setup.bash
 ```
 
@@ -113,7 +114,10 @@ Topic names are unchanged from the ROS 1 package:
 Both carry identical metadata; they differ only in the sonar results. The
 message types are `omniscan_sidescan_msgs/msg/SideScanSonar[Raw]` for the
 two-sonar node and `.../SideScanSonarAll[Raw]` for the four-sonar node, with
-the same fields as the ROS 1 messages.
+the same fields as the ROS 1 messages. Profile arrays are bounded to the
+device maximum of 1200 samples. Both topics use the ROS 2 sensor-data QoS
+profile (best effort, volatile, depth 5) to favor current sonar data over an
+increasing reliable backlog.
 
 ### Parameters
 
@@ -140,13 +144,18 @@ ros2 param set /omniscan450all gain_index 3
 | `num_results` | 200–1200 | 600 |
 
 `frame_id` and `read_timeout` are also settable at run time. The sonar
-addresses (`<channel>_ip_address`, `<channel>_port`) and `sensor_number` are
-read-only, since changing them would mean reconnecting.
+addresses (`<channel>_ip_address`, `<channel>_port`), `connect_timeout`,
+`max_consecutive_failures`, and `sensor_number` are read-only, since changing
+them affects connection lifecycle or graph names. A value of `10` persistent
+profile failures triggers the launch file's respawn path; set it to `0` to
+wait indefinitely.
+Updates that affect multiple sonars are applied transactionally and rolled
+back if any channel rejects the write.
 
 ## Testing
 
 ```
-colcon test --packages-select omniscan_sidescan
+colcon test --packages-select omniscan_sidescan_msgs omniscan_sidescan
 colcon test-result --all
 ```
 
@@ -172,8 +181,16 @@ Behaviour is otherwise a straight port; these are the deliberate changes.
   as the loop rate, which with the default of `0` is not a valid rate. The read
   loop now runs at whatever rate the sonars deliver.
 - **Errors are reported, not swallowed.** A bare `except:` hid every read
-  failure; failures now raise `SonarError`, are logged once, and recovery is
-  logged too.
+  failure; timeouts, malformed profiles, and broken connections now have
+  distinct errors. Broken connections terminate the node so a launch
+  `respawn` can establish fresh sockets; transient misses are logged once per
+  channel and recovery is logged too.
+- **Complete, low-latency TCP I/O.** Writes cannot silently truncate protocol
+  packets, reads block efficiently on the socket using monotonic deadlines,
+  and each cycle drains every channel before publishing the newest profiles.
+- **Consistent multi-sonar output.** A combined message is held back while
+  channels disagree on scan geometry, avoiding arrays labeled with another
+  channel's range metadata during configuration transitions.
 - **`start_mm` is applied.** The ROS 1 `set_parameters` assigned `length_mm`
   when `start_mm` changed, so `start_mm` never took effect.
 - **`dynamic_reconfigure` → ROS 2 parameters**, with the same names and ranges.

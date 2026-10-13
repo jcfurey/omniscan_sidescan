@@ -1,27 +1,33 @@
 <?xml version="1.0"?>
-<?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypens="http://relaxng.org/ns/structure/1.0"?>
+<?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypens="http://www.w3.org/2001/XMLSchema"?>
 <package format="3">
   <name>omniscan_sidescan</name>
   <version>1.0.0</version>
   <description>ROS 2 driver for the Cerulean Omniscan 450 side scan sonar.</description>
 
   <maintainer email="mrozner1@binghamton.edu">Monika Roznere</maintainer>
+  <license>MIT</license>
   <author email="mrozner1@binghamton.edu">Monika Roznere</author>
 
-  <license>MIT</license>
+  <buildtool_depend>ament_cmake_auto</buildtool_depend>
+  <buildtool_depend>ament_cmake_python</buildtool_depend>
 
   <depend>omniscan_sidescan_msgs</depend>
+  <depend>rcl_interfaces</depend>
   <depend>rclpy</depend>
 
+  <exec_depend>ament_index_python</exec_depend>
   <exec_depend>launch</exec_depend>
   <exec_depend>launch_ros</exec_depend>
+  <exec_depend>ros2bag</exec_depend>
   <exec_depend>rosbag2_transport</exec_depend>
 
+  <test_depend>ament_cmake_pytest</test_depend>
   <test_depend>ament_flake8</test_depend>
   <test_depend>ament_pep257</test_depend>
   <test_depend>python3-pytest</test_depend>
 
   <export>
-    <build_type>ament_python</build_type>
+    <build_type>ament_cmake</build_type>
   </export>
 </package>

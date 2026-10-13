@@ -22,8 +22,12 @@
     stern_port: 51200
 
     frame_id: "sonar"
+    # Seconds to wait while opening each sonar connection at startup.
+    connect_timeout: 5.0
     # Seconds to wait for a profile from each sonar before reporting a miss.
     read_timeout: 0.5
+    # Exit for launch respawn after this many failures; 0 disables the limit.
+    max_consecutive_failures: 10
 
     # Tunables; these can be changed while the node runs with
     # `ros2 param set`, and apply to every sonar the node owns.

@@ -15,6 +15,7 @@ this directory.  Two deliberate changes from upstream:
 """
 
 import socket
+import select
 import time
 from collections import deque
 
@@ -38,6 +39,8 @@ class PingDevice(object):
         # IO device
         self.iodev = None
         self.server_address = None
+        self._is_stream = False
+        self._write_timeout = 5.0
 
     def connect_tcp(self, host=None, port=51200, timeout=5.0):
         """Connect to the device over TCP.
@@ -50,35 +53,64 @@ class PingDevice(object):
         if host is None:
             host = '0.0.0.0'
 
+        self.close()
         self.server_address = (host, port)
+        sock = None
         try:
-            self.iodev = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            self.iodev.settimeout(timeout)
-            self.iodev.connect(self.server_address)
-            self.iodev.setblocking(False)
+            # create_connection handles DNS as well as IPv4/IPv6 and closes
+            # failed address attempts internally.
+            sock = socket.create_connection(self.server_address, timeout)
+            sock.setblocking(False)
         except socket.timeout:
             raise ConnectionError(
                 "Connection to %s:%d timed out after %s seconds"
                 % (host, port, timeout))
         except OSError as exception:
+            if sock is not None:
+                sock.close()
             raise ConnectionError(
                 "Failed to open TCP connection to %s:%d: %s"
                 % (host, port, exception))
+
+        self.iodev = sock
+        self.server_address = self.iodev.getpeername()
+        self._is_stream = True
+        self._write_timeout = timeout
+        self._reset_input()
 
     def connect_udp(self, host=None, port=51200):
         """Connect to the device over UDP."""
         if host is None:
             host = '0.0.0.0'
 
+        self.close()
         self.server_address = (host, port)
+        sock = None
         try:
-            self.iodev = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-            self.iodev.connect(self.server_address)
-            self.iodev.setblocking(False)
+            addresses = socket.getaddrinfo(
+                host, port, type=socket.SOCK_DGRAM)
+            if not addresses:
+                raise OSError('no addresses found')
+            family, socktype, protocol, _, address = addresses[0]
+            sock = socket.socket(family, socktype, protocol)
+            sock.connect(address)
+            sock.setblocking(False)
         except OSError as exception:
+            if sock is not None:
+                sock.close()
             raise ConnectionError(
                 "Failed to open UDP connection to %s:%d: %s"
                 % (host, port, exception))
+
+        self.iodev = sock
+        self.server_address = self.iodev.getpeername()
+        self._is_stream = False
+        self._reset_input()
+
+    def _reset_input(self):
+        """Discard parser state and bytes left over from an old connection."""
+        self.parser = pingmessage.PingParser()
+        self._input_buffer.clear()
 
     def read_io(self):
         """Read whatever is available from the io device into the buffer."""
@@ -93,7 +125,7 @@ class PingDevice(object):
 
                 if not data:
                     # An empty recv() on a stream socket means the peer closed.
-                    if self.iodev.type == socket.SOCK_STREAM:
+                    if self._is_stream:
                         raise ConnectionError("TCP connection closed by peer.")
                     break
 
@@ -107,9 +139,9 @@ class PingDevice(object):
             except BlockingIOError:
                 # Nothing available yet; normal for a non-blocking socket.
                 break
-            except ConnectionResetError as exception:
+            except OSError as exception:
                 raise ConnectionError(
-                    "Socket connection was reset: %s" % exception)
+                    "Failed to read from socket: %s" % exception)
 
     def read(self):
         """Consume rx buffer data until a message is decoded.
@@ -129,12 +161,62 @@ class PingDevice(object):
                 return self.parser.rx_msg
         return None
 
-    def write(self, data):
-        """Write a bytearray to the device and return the bytes written."""
+    def write(self, data, timeout=None):
+        """Write all bytes to the device and return the bytes written.
+
+        ``socket.send`` may accept only part of a packet, especially when a
+        non-blocking socket is under backpressure.  Ping packets must remain
+        whole on the stream, so retry until all bytes are accepted or the
+        write deadline expires.
+        """
         if self.iodev is None:
             raise ConnectionError(
                 "IO device is null, configure a connection before writing.")
-        return self.iodev.send(data)
+
+        write_timeout = self._write_timeout if timeout is None else timeout
+        deadline = time.monotonic() + write_timeout
+        view = memoryview(data)
+        written = 0
+
+        while view:
+            try:
+                sent = self.iodev.send(view)
+            except BlockingIOError:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise ConnectionError(
+                        "Timed out while writing to the device.")
+                _, writable, _ = select.select(
+                    [], [self.iodev], [], remaining)
+                if not writable:
+                    raise ConnectionError(
+                        "Timed out while writing to the device.")
+                continue
+            except OSError as exception:
+                raise ConnectionError(
+                    "Failed to write to socket: %s" % exception)
+
+            if sent == 0:
+                raise ConnectionError("Socket connection closed while writing.")
+            written += sent
+            view = view[sent:]
+
+        return written
+
+    def wait_readable(self, timeout):
+        """Wait until the socket can be read, returning False on timeout."""
+        if self.iodev is None:
+            raise ConnectionError(
+                "IO device is null, configure a connection before reading.")
+        try:
+            readable, _, exceptional = select.select(
+                [self.iodev], [], [self.iodev], max(0.0, timeout))
+        except (OSError, ValueError) as exception:
+            raise ConnectionError(
+                "Failed while waiting for socket data: %s" % exception)
+        if exceptional:
+            raise ConnectionError("Socket reported an exceptional condition.")
+        return bool(readable)
 
     def initialize(self):
         """Return True if the device replies to a protocol version request."""
@@ -154,13 +236,21 @@ class PingDevice(object):
 
     def wait_message(self, message_ids, timeout=0.5):
         """Wait up to timeout seconds for a message with one of these ids."""
-        tstart = time.time()
-        while time.time() < tstart + timeout:
+        deadline = time.monotonic() + timeout
+        while True:
             msg = self.read()
             if msg is not None and msg.message_id in message_ids:
                 return msg
-            time.sleep(0.005)
-        return None
+
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return None
+
+            # Continue immediately when read() left complete or partial data
+            # in the userspace queue.  Otherwise block in select instead of
+            # polling every 5 ms.
+            if not self._input_buffer:
+                self.wait_readable(remaining)
 
     def handle_message(self, msg):
         """Extract the fields of an incoming message into self attributes.
@@ -221,3 +311,5 @@ class PingDevice(object):
                 self.iodev.close()
             finally:
                 self.iodev = None
+                self._is_stream = False
+                self._reset_input()

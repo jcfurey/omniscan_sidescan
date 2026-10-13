@@ -13,7 +13,11 @@ from . import definitions
 payload_dict = definitions.payload_dict_all
 
 # Messages whose final field is an ASCII string of run-time length.
-asciiMsgs = [definitions.COMMON_NACK, definitions.COMMON_ASCII_TEXT]
+asciiMsgs = [
+    definitions.COMMON_NACK,
+    definitions.COMMON_ASCII_TEXT,
+    definitions.OMNISCAN450_JSON_WRAPPER,
+]
 
 # Messages whose final field is a byte vector of run-time length.
 variable_msgs = [definitions.OMNISCAN450_OS_MONO_PROFILE]
@@ -77,6 +81,9 @@ class PingMessage(object):
         ## Number of bytes in the message payload
         self.payload_length = 0
 
+        ## Whether an incoming message was structurally valid
+        self.valid = False
+
         if msg_data is not None:
             # Decode an incoming buffer.
             if not self.unpack_msg_data(msg_data):
@@ -94,13 +101,16 @@ class PingMessage(object):
                 for attr in self.payload_field_names:
                     setattr(self, attr, 0)
 
-                if self.message_id in variable_msgs:
+                if (self.message_id in variable_msgs
+                        or self.message_id in asciiMsgs):
                     setattr(self, self.payload_field_names[-1], bytearray())
 
                 self.update_payload_length()
 
                 ## The struct formatting string for the message payload
                 self.payload_format = self.get_payload_format()
+
+                self.valid = True
 
             except KeyError:
                 raise KeyError("message id not recognized: %d" % self.message_id)
@@ -140,17 +150,38 @@ class PingMessage(object):
         """
         self.msg_data = msg_data
 
-        header = struct.unpack(
-            PingMessage.endianess + PingMessage.header_format,
-            self.msg_data[0:PingMessage.headerLength])
+        if len(self.msg_data) < self.headerLength + self.checksumLength:
+            return False
+
+        try:
+            header = struct.unpack(
+                PingMessage.endianess + PingMessage.header_format,
+                self.msg_data[0:PingMessage.headerLength])
+        except struct.error:
+            return False
 
         for i, attr in enumerate(PingMessage.header_field_names):
             setattr(self, attr, header[i])
+
+        if self.start_1 != ord('B') or self.start_2 != ord('R'):
+            return False
 
         try:
             ## The name of this message
             self.name = payload_dict[self.message_id]["name"]
         except KeyError:
+            return False
+
+        expected_size = (
+            self.headerLength + self.payload_length + self.checksumLength)
+        if len(self.msg_data) != expected_size:
+            return False
+
+        static_length = payload_dict[self.message_id]["payload_length"]
+        if self.message_id in variable_msgs or self.message_id in asciiMsgs:
+            if self.payload_length < static_length:
+                return False
+        elif self.payload_length != static_length:
             return False
 
         ## The field names of this message
@@ -160,24 +191,35 @@ class PingMessage(object):
             ## The struct formatting string for the message payload
             self.payload_format = self.get_payload_format()
 
-            payload = struct.unpack(
-                PingMessage.endianess + self.payload_format,
-                self.msg_data[PingMessage.headerLength:
-                              PingMessage.headerLength + self.payload_length])
+            try:
+                payload = struct.unpack(
+                    PingMessage.endianess + self.payload_format,
+                    self.msg_data[PingMessage.headerLength:
+                                  PingMessage.headerLength
+                                  + self.payload_length])
+            except struct.error:
+                return False
 
             for i, attr in enumerate(self.payload_field_names):
                 try:
                     setattr(self, attr, payload[i])
                 except IndexError:
                     # Empty trailing variable length field.
-                    if self.message_id in variable_msgs:
+                    if (self.message_id in variable_msgs
+                            or self.message_id in asciiMsgs):
                         setattr(self, attr, bytearray())
+        elif self.message_id in variable_msgs or self.message_id in asciiMsgs:
+            setattr(self, self.payload_field_names[-1], bytearray())
 
-        self.checksum = struct.unpack(
-            PingMessage.endianess + PingMessage.checksum_format,
-            self.msg_data[PingMessage.headerLength + self.payload_length:
-                          PingMessage.headerLength + self.payload_length
-                          + PingMessage.checksumLength])[0]
+        try:
+            self.checksum = struct.unpack(
+                PingMessage.endianess + PingMessage.checksum_format,
+                self.msg_data[PingMessage.headerLength + self.payload_length:
+                              PingMessage.headerLength + self.payload_length
+                              + PingMessage.checksumLength])[0]
+        except struct.error:
+            return False
+        self.valid = True
         return True
 
     def calculate_checksum(self):
@@ -298,6 +340,10 @@ class PingParser(object):
         if msg_byte == ord('R'):
             self.buf.append(msg_byte)
             self.state += 1
+        elif msg_byte == ord('B'):
+            # The second B may be the beginning of a valid ``BR`` sequence.
+            self.buf = bytearray([msg_byte])
+            self.state = self.WAIT_HEADER
         else:
             self.state = self.WAIT_START
 
@@ -349,7 +395,7 @@ class PingParser(object):
         self.buf.append(msg_byte)
         self.rx_msg = PingMessage(msg_data=self.buf)
 
-        if self.rx_msg.verify_checksum():
+        if self.rx_msg.valid and self.rx_msg.verify_checksum():
             self.parsed += 1
             return self.NEW_MESSAGE
 

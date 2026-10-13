@@ -128,6 +128,47 @@ def test_parser_recovers_after_leading_garbage():
     assert parser.parsed == 1
 
 
+def test_parser_recovers_when_start_marker_is_repeated():
+    msg = build_profile(num_results=4)
+    parser = PingParser()
+
+    assert feed(parser, b'B' + msg.msg_data) == PingParser.NEW_MESSAGE
+    assert parser.rx_msg.ping_number == 42
+
+
+def test_parser_rejects_a_known_message_with_the_wrong_payload_length():
+    msg = PingMessage(definitions.COMMON_DEVICE_INFORMATION)
+    msg.device_type = 3
+    msg.device_revision = 1
+    msg.firmware_version_major = 1
+    msg.firmware_version_minor = 2
+    msg.firmware_version_patch = 3
+    msg.reserved = 0
+    msg.pack_msg_data()
+
+    body = bytearray(msg.msg_data[:8 + 5])
+    body[2:4] = struct.pack('<H', 5)
+    malformed = body + struct.pack('<H', sum(body) & 0xffff)
+    parser = PingParser()
+
+    assert feed(parser, malformed) == PingParser.ERROR
+    assert parser.errors == 1
+
+
+def test_variable_length_text_message_round_trips():
+    msg = PingMessage(definitions.COMMON_NACK)
+    msg.nacked_id = definitions.OMNISCAN450_OS_PING_PARAMS
+    msg.nack_message = b'unsupported value'
+    msg.pack_msg_data()
+
+    decoded = PingMessage(msg_data=msg.msg_data)
+
+    assert decoded.valid
+    assert decoded.nacked_id == definitions.OMNISCAN450_OS_PING_PARAMS
+    assert decoded.nack_message == b'unsupported value'
+    assert decoded.verify_checksum()
+
+
 def test_parser_reports_a_bad_checksum():
     msg = build_profile(num_results=4)
     corrupted = bytearray(msg.msg_data)

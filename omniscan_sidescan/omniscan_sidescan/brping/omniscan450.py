@@ -6,8 +6,9 @@ this directory.  The .svlog recording helpers are omitted; ROS 2 bags cover
 that need here.
 """
 
+from array import array
 import math
-import struct
+import sys
 import time
 
 from . import definitions
@@ -107,9 +108,10 @@ class Omniscan450(PingDevice):
     def scale_power(msg):
         """Scale u16 power results back to dB using the message's dB range."""
         span = msg.max_pwr_db - msg.min_pwr_db
-        return tuple(
-            msg.min_pwr_db + (result / 65535.0) * span
-            for result in msg.pwr_results
+        return array(
+            'f',
+            (msg.min_pwr_db + (result / 65535.0) * span
+             for result in msg.pwr_results)
         )
 
     @staticmethod
@@ -124,8 +126,13 @@ class Omniscan450(PingDevice):
         if len(msg.pwr_results) != 2 * num_results:
             return False
 
-        msg.pwr_results = struct.unpack(
-            '<' + 'H' * num_results, bytearray(msg.pwr_results))
+        results = array('H')
+        results.frombytes(msg.pwr_results)
+        if results.itemsize != 2:
+            return False
+        if sys.byteorder != 'little':
+            results.byteswap()
+        msg.pwr_results = results
         return True
 
     def wait_message(self, message_ids, timeout=0.5, latest=False):
@@ -137,17 +144,21 @@ class Omniscan450(PingDevice):
         lets the socket backlog -- and the reported range -- fall further and
         further behind real time.
         """
-        tstart = time.time()
+        deadline = time.monotonic() + timeout
         found = None
 
-        while time.time() < tstart + timeout:
+        while True:
             msg = self.read()
 
             if msg is None:
                 # Buffer is dry; stop here if we already have something.
                 if found is not None:
                     return found
-                time.sleep(0.005)
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return None
+                if not self._input_buffer:
+                    self.wait_readable(remaining)
                 continue
 
             if msg.message_id == definitions.OMNISCAN450_OS_MONO_PROFILE:
@@ -159,4 +170,5 @@ class Omniscan450(PingDevice):
                     return msg
                 found = msg
 
-        return found
+            if time.monotonic() >= deadline:
+                return found

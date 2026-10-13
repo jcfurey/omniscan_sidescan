@@ -3,8 +3,9 @@
 
 from launch import LaunchDescription
 from launch.actions import DeclareLaunchArgument
-from launch.substitutions import LaunchConfiguration, PythonExpression
+from launch.substitutions import LaunchConfiguration
 from launch_ros.actions import Node
+from launch_ros.parameter_descriptions import ParameterValue
 
 ARGUMENTS = (
     ('sensor_number', '450', 'sensor number used in the topic names'),
@@ -17,6 +18,10 @@ ARGUMENTS = (
     ('stern_ip_address', '192.168.2.92', 'address of the stern sonar'),
     ('stern_port', '51200', 'TCP port of the stern sonar'),
     ('frame_id', 'sonar', 'frame_id stamped on published messages'),
+    ('connect_timeout', '5.0', 'seconds to wait for each TCP connection'),
+    ('read_timeout', '0.5', 'seconds to wait for each sonar profile'),
+    ('max_consecutive_failures', '10',
+     'profile failures before exiting for launch respawn; 0 disables'),
     ('speed_of_sound_mm', '1482000', 'speed of sound in water, in mm/s'),
     ('start_mm', '0', 'start of ping range, in mm'),
     ('length_mm', '6000', 'length of the returned profile, in mm'),
@@ -31,11 +36,14 @@ ARGUMENTS = (
 # they are converted before being handed over.
 INTEGER_PARAMETERS = (
     'sensor_number', 'port_port', 'starboard_port', 'bow_port', 'stern_port',
-    'speed_of_sound_mm', 'start_mm', 'length_mm', 'msec_per_ping',
-    'gain_index', 'num_results',
+    'max_consecutive_failures', 'speed_of_sound_mm', 'start_mm', 'length_mm',
+    'msec_per_ping', 'gain_index', 'num_results',
 )
 
-FLOAT_PARAMETERS = ('pulse_len_percent', 'filter_duration_percent')
+FLOAT_PARAMETERS = (
+    'connect_timeout', 'read_timeout', 'pulse_len_percent',
+    'filter_duration_percent',
+)
 
 
 def _parameters():
@@ -44,9 +52,9 @@ def _parameters():
     for name, _, _ in ARGUMENTS:
         configuration = LaunchConfiguration(name)
         if name in INTEGER_PARAMETERS:
-            parameters[name] = PythonExpression(['int(', configuration, ')'])
+            parameters[name] = ParameterValue(configuration, value_type=int)
         elif name in FLOAT_PARAMETERS:
-            parameters[name] = PythonExpression(['float(', configuration, ')'])
+            parameters[name] = ParameterValue(configuration, value_type=float)
         else:
             parameters[name] = configuration
     return parameters
