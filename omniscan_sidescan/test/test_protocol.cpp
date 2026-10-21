@@ -152,6 +152,7 @@ TEST(Protocol, FragmentationCoalescingChecksumAndResynchronization)
 TEST(Protocol, RejectsOversizedHeaderAndExpiresTruncatedFrame)
 {
   wire::Parser parser;
+  EXPECT_FALSE(parser.assembly_deadline());
   auto now = os::SteadyClock::now();
   const std::array<uint8_t, 8> huge{'B', 'R', 0xff, 0xff, 0x96, 8, 0, 0};
   parser.feed(huge, now, 0);
@@ -161,9 +162,12 @@ TEST(Protocol, RejectsOversizedHeaderAndExpiresTruncatedFrame)
   // until the bounded frame assembly deadline expires.
   const std::array<uint8_t, 8> truncated{'B', 'R', 0, 4, 2, 0, 0, 0};
   parser.feed(truncated, now, 0);
+  ASSERT_TRUE(parser.assembly_deadline());
+  EXPECT_EQ(*parser.assembly_deadline(), now + std::chrono::seconds(1));
   const auto good = wire::encode(4, std::array<uint8_t, 6>{3, 1, 1, 2, 3, 0});
   const auto received = now;
   EXPECT_TRUE(parser.feed(good, now, 77).empty());
+  EXPECT_EQ(*parser.assembly_deadline(), now + std::chrono::seconds(1));
   now += std::chrono::seconds(2);
   const auto recovered = parser.feed({}, now, 42);
   ASSERT_EQ(recovered.size(), 1u);
@@ -171,6 +175,7 @@ TEST(Protocol, RejectsOversizedHeaderAndExpiresTruncatedFrame)
   EXPECT_EQ(recovered.front().timestamp_ns, 77);
   EXPECT_EQ(recovered.front().received, received);
   EXPECT_EQ(parser.errors(), 2u);
+  EXPECT_FALSE(parser.assembly_deadline());
 }
 
 TEST(Protocol, RandomNoiseRemainsBoundedAndCanRecover)

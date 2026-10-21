@@ -191,11 +191,18 @@ bool matches(const Profile & p, const Params & params)
 
 void Parser::expire(Deadline now)
 {
-  if (partial_since_ != Deadline{} && now - partial_since_ >= std::chrono::seconds(1)) {
+  const auto deadline = assembly_deadline();
+  if (deadline && now >= *deadline) {
     if (!buffer_.empty()) {consume(1);}
     partial_since_ = {};
     ++errors_;
   }
+}
+
+std::optional<Deadline> Parser::assembly_deadline() const
+{
+  if (partial_since_ == Deadline{}) {return {};}
+  return partial_since_ + std::chrono::seconds(1);
 }
 
 void Parser::consume(size_t count)

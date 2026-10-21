@@ -169,7 +169,13 @@ std::optional<Packet> Connection::read(
     if (count == 0) {throw ConnectionError("TCP peer closed the connection");}
     if (errno == EINTR) {continue;}
     if (errno != EAGAIN && errno != EWOULDBLOCK) {throw ConnectionError(system_error("recv"));}
-    if (!block || !wait(POLLIN, deadline, false, interrupted)) {return {};}
+    if (!block) {return {};}
+    // Frame assembly must expire even if the peer goes quiet during a long
+    // profile/configuration wait. Keep the caller's overall deadline intact.
+    const auto wake_deadline = std::min(deadline, parser_.assembly_deadline().value_or(deadline));
+    if (!wait(POLLIN, wake_deadline, false, interrupted) && SteadyClock::now() >= deadline) {
+      return {};
+    }
   }
 }
 

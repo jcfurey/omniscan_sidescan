@@ -70,6 +70,9 @@ class ControlledSimulator(Omniscan450Simulator):
     last_requested_length = None
     fragment_responses = False
     noise_only = False
+    truncate_next_profile = False
+    truncate_at_length = None
+    truncated_profile_ping = None
 
     def _handle_connection(self, connection):
         self.connections += 1
@@ -91,6 +94,11 @@ class ControlledSimulator(Omniscan450Simulator):
     def _handle_request(self, connection, requested_id):
         if not self.ignore_information:
             super()._handle_request(connection, requested_id)
+            if requested_id == 4 and self.length_mm == self.truncate_at_length:
+                # Inject after the ordered command barrier; earlier profiles
+                # cannot confirm a configuration and are intentionally ignored.
+                self.truncate_next_profile = True
+                self.truncate_at_length = None
 
     def _build_profile(self):
         if self.noise_only:
@@ -109,6 +117,13 @@ class ControlledSimulator(Omniscan450Simulator):
             struct.pack_into('<H', packet, len(packet) - 2, sum(packet[:-2]) & 0xffff)
         if self.bad_checksum:
             packet[-1] ^= 1
+        if self.truncate_next_profile:
+            self.truncate_next_profile = False
+            self.enabled = False
+            self.truncated_profile_ping = counter
+            # A plausible incomplete NACK can hide a complete profile. Stop
+            # sending so recovery must follow the frame timer, not socket I/O.
+            return b'BR\x00\x10\x02\x00\x00\x00' + packet
         return packet
 
 
@@ -432,6 +447,55 @@ def test_cpp_read_timeout_update_interrupts_the_previous_deadline(native_factory
     h.wait(lambda: h.combined[-1].starboard_ping_number > 0)
     assert h.devices['port'].connections == 1
     assert h.profiles['port'][-1].configuration_generation == 0
+
+
+@pytest.mark.parametrize('read_timeout', [0.05, 60.0])
+@pytest.mark.parametrize('max_profile_age', [0.5, 5.0])
+def test_cpp_truncated_frame_expires_during_a_silent_read(
+        native_factory, read_timeout, max_profile_age):
+    h = native_factory(read_timeout=read_timeout, max_profile_age=max_profile_age,
+                       max_consecutive_failures=0)
+    h.wait(lambda: h.combined)
+    faulty = h.devices['starboard']
+    faulty.truncate_next_profile = True
+    h.wait(lambda: faulty.truncated_profile_ping is not None)
+    if max_profile_age > 1.0:
+        h.wait(lambda: any(message.ping_number == faulty.truncated_profile_ping
+                           for message in h.profiles['starboard']), timeout=2.0)
+        recovered = next(message for message in h.profiles['starboard']
+                         if message.ping_number == faulty.truncated_profile_ping)
+        stamp = recovered.header.stamp.sec * 1000000000 + recovered.header.stamp.nanosec
+        age = (h.node.get_clock().now().nanoseconds - stamp) / 1e9
+        assert 0.8 < age < 2.5  # Recovery must preserve original receipt time.
+    h.wait(lambda: h.status('starboard') is not None and any(
+        item.key == 'parser_errors' and int(item.value) > 0
+        for item in h.status('starboard').values), timeout=2.5)
+    if max_profile_age < 1.0:
+        assert not any(message.ping_number == faulty.truncated_profile_ping
+                       for message in h.profiles['starboard'])
+        assert h.status('starboard').level == DiagnosticStatus.ERROR
+    assert all(device.connections == 1 for device in h.devices.values())
+    before = len(h.combined)
+    faulty.enabled = True
+    h.wait(lambda: len(h.combined) > before)
+
+
+def test_cpp_truncated_profile_can_confirm_configuration_during_silence(native_factory):
+    h = native_factory(configuration_timeout=60.0, read_timeout=60.0)
+    h.wait(lambda: h.combined)
+    faulty = h.devices['starboard']
+    faulty.truncate_at_length = 7000
+    assert h.update(length_mm=7000).successful
+    h.wait(lambda: faulty.truncated_profile_ping is not None)
+    h.wait(lambda: h.status('starboard') is not None and any(
+        item.key == 'applied_generation' and item.value == '1'
+        for item in h.status('starboard').values), timeout=2.5)
+    assert all(device.connections == 1 for device in h.devices.values())
+    assert not faulty.enabled
+    faulty.enabled = True
+    h.wait(lambda: h.combined[-1].length_mm == 7000)
+    assert all(messages[-1].configuration_generation == 1
+               for messages in h.profiles.values())
 
 
 def test_cpp_new_settings_supersede_unconfirmed_configuration(native_factory):

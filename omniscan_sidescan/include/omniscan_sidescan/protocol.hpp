@@ -6,6 +6,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <deque>
+#include <optional>
 #include <span>
 #include <stdexcept>
 #include <vector>
@@ -84,6 +85,7 @@ public:
   std::vector<Packet> feed(
     std::span<const uint8_t> bytes, Deadline received, int64_t timestamp_ns);
   void expire(Deadline now);
+  std::optional<Deadline> assembly_deadline() const;
   uint64_t errors() const {return errors_;}
   size_t buffered_bytes() const {return buffer_.size();}
 

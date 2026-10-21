@@ -256,6 +256,10 @@ do not count as profile failures, and metadata-only changes do not interrupt
 acquisition. Read waits check for updates at most every 50 ms; packet writes
 finish before the new settings are applied.
 
+Incomplete frames expire after one second, including during silent TCP reads
+with longer timeouts. Profiles recovered behind a truncated frame retain their
+original host receipt timestamps and remain subject to the normal age limit.
+
 ## Testing
 
 ```
@@ -274,8 +278,9 @@ waits. The Python reference driver's regression suite is also retained.
 
 Additional native tests cover superseding 60-second reads/configuration waits,
 long retry backoff, fragmented TCP traffic, continuous malformed input, rapid
-parameter updates, and repeated lifecycle cleanup. Lifecycle tests check that
-threads and descriptors are released. A ROS-independent channel stress helper
+parameter updates, silent truncated-frame recovery, and repeated lifecycle
+cleanup. Lifecycle tests check that threads and descriptors are released.
+A ROS-independent channel stress helper
 runs four concurrent snapshot readers while applying 60 configuration updates
 and starting and stopping all four workers three times. It can also be built
 with thread, address, and undefined-behavior sanitizers.
