@@ -16,6 +16,15 @@ from . import pingmessage
 from .device import PingDevice
 
 
+class NackError(RuntimeError):
+    """A command was explicitly rejected by the device."""
+
+    def __init__(self, message):
+        self.command_id = message.nacked_id
+        reason = bytes(message.nack_message).decode('utf-8', errors='replace')
+        super().__init__('command %d rejected: %s' % (self.command_id, reason))
+
+
 class Omniscan450(PingDevice):
     """Talks to an Omniscan 450 over ping-protocol."""
 
@@ -88,9 +97,18 @@ class Omniscan450(PingDevice):
         m.pack_msg_data()
         self.write(m.msg_data)
 
-    def readDeviceInformation(self):
+    def readDeviceInformation(self, timeout=0.5):
         """Request the common device information message."""
-        return self.request(definitions.COMMON_DEVICE_INFORMATION)
+        return self.request(definitions.COMMON_DEVICE_INFORMATION, timeout)
+
+    def handle_message(self, msg):
+        """Surface NACKs even while a different reply is being awaited."""
+        if msg.message_id == definitions.COMMON_NACK:
+            raise NackError(msg)
+        if msg.message_id == definitions.OMNISCAN450_OS_MONO_PROFILE:
+            msg.received_monotonic = time.monotonic()
+            msg.received_timestamp_ns = self.clock_ns()
+        return super().handle_message(msg)
 
     @staticmethod
     def calc_msec_per_ping(ping_rate):
@@ -123,7 +141,8 @@ class Omniscan450(PingDevice):
         of struct.unpack on a truncated or corrupt profile.
         """
         num_results = int(msg.num_results)
-        if len(msg.pwr_results) != 2 * num_results:
+        if not 0 < num_results <= definitions.OMNISCAN450_MAX_RESULTS \
+                or len(msg.pwr_results) != 2 * num_results:
             return False
 
         results = array('H')
@@ -163,6 +182,8 @@ class Omniscan450(PingDevice):
 
             if msg.message_id == definitions.OMNISCAN450_OS_MONO_PROFILE:
                 if not self._unpack_profile(msg):
+                    if time.monotonic() >= deadline:
+                        return found
                     continue
 
             if msg.message_id in message_ids:

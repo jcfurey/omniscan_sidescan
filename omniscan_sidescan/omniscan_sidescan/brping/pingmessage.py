@@ -7,6 +7,7 @@ reduced to the ones the Omniscan 450 uses.
 """
 
 import struct
+import time
 
 from . import definitions
 
@@ -305,6 +306,7 @@ class PingParser(object):
         "errors",
         "parsed",
         "rx_msg",
+        "frame_started",
     )
 
     NEW_MESSAGE = 0       # Just got a complete checksum-verified message
@@ -329,10 +331,23 @@ class PingParser(object):
         self.errors = 0
         self.parsed = 0
         self.rx_msg = None       # most recently parsed message
+        self.frame_started = 0.0
+
+    def expire(self, now=None):
+        """Discard an incomplete frame after one second without completion."""
+        now = time.monotonic() if now is None else now
+        if self.state != self.WAIT_START and now - self.frame_started >= 1.0:
+            self.state = self.WAIT_START
+            self.buf = bytearray()
+            self.payload_length = 0
+            self.errors += 1
+            return True
+        return False
 
     def wait_start(self, msg_byte):
         self.buf = bytearray()
         if msg_byte == ord('B'):
+            self.frame_started = time.monotonic()
             self.buf.append(msg_byte)
             self.state += 1
 
@@ -344,6 +359,7 @@ class PingParser(object):
             # The second B may be the beginning of a valid ``BR`` sequence.
             self.buf = bytearray([msg_byte])
             self.state = self.WAIT_HEADER
+            self.frame_started = time.monotonic()
         else:
             self.state = self.WAIT_START
 
@@ -373,6 +389,20 @@ class PingParser(object):
 
     def wait_dst_id(self, msg_byte):
         self.buf.append(msg_byte)
+        definition = payload_dict.get(self.message_id)
+        static_length = definition['payload_length'] if definition else 0
+        if self.message_id == definitions.OMNISCAN450_OS_MONO_PROFILE:
+            valid = (static_length <= self.payload_length
+                     <= static_length + 2 * definitions.OMNISCAN450_MAX_RESULTS
+                     and (self.payload_length - static_length) % 2 == 0)
+        elif self.message_id in asciiMsgs:
+            valid = static_length <= self.payload_length <= 4096
+        else:
+            valid = definition is not None and self.payload_length == static_length
+        if not valid:
+            self.state = self.WAIT_START
+            self.errors += 1
+            return self.ERROR
         self.state += 1
         if self.payload_length == 0:  # no payload bytes -> skip waiting
             self.state += 1

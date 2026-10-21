@@ -13,6 +13,7 @@ rosidl_generate_interfaces(${PROJECT_NAME}
   "msg/SideScanSonarRaw.msg"
   "msg/SideScanSonarAll.msg"
   "msg/SideScanSonarAllRaw.msg"
+  "msg/SonarProfile.msg"
   DEPENDENCIES std_msgs
 )
 

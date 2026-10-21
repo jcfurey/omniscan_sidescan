@@ -14,10 +14,17 @@ ARGUMENTS = (
     ('starboard_ip_address', '192.168.2.95', 'address of the starboard sonar'),
     ('starboard_port', '51200', 'TCP port of the starboard sonar'),
     ('frame_id', 'sonar', 'frame_id stamped on published messages'),
+    ('port_frame_id', 'sonar_port', 'physical frame of the port sonar'),
+    ('starboard_frame_id', 'sonar_starboard', 'physical frame of the starboard sonar'),
     ('connect_timeout', '5.0', 'seconds to wait for each TCP connection'),
+    ('configuration_timeout', '2.0', 'seconds to confirm profile settings'),
     ('read_timeout', '0.5', 'seconds to wait for each sonar profile'),
+    ('reconnect_initial_delay', '0.25', 'initial reconnect backoff in seconds'),
+    ('reconnect_max_delay', '10.0', 'maximum reconnect backoff in seconds'),
+    ('max_profile_age', '0.5', 'maximum host receive age in seconds'),
+    ('max_profile_skew', '0.05', 'maximum combined host receive skew in seconds'),
     ('max_consecutive_failures', '10',
-     'profile failures before exiting for launch respawn; 0 disables'),
+     'profile failures before reconnecting one channel; 0 disables'),
     ('speed_of_sound_mm', '1482000', 'speed of sound in water, in mm/s'),
     ('start_mm', '0', 'start of ping range, in mm'),
     ('length_mm', '5000', 'length of the returned profile, in mm'),
@@ -37,8 +44,9 @@ INTEGER_PARAMETERS = (
 )
 
 FLOAT_PARAMETERS = (
-    'connect_timeout', 'read_timeout', 'pulse_len_percent',
-    'filter_duration_percent',
+    'connect_timeout', 'configuration_timeout', 'read_timeout', 'pulse_len_percent',
+    'filter_duration_percent', 'reconnect_initial_delay', 'reconnect_max_delay',
+    'max_profile_age', 'max_profile_skew',
 )
 
 
@@ -66,8 +74,8 @@ def generate_launch_description():
             name=['omniscan', LaunchConfiguration('sensor_number')],
             output='screen',
             emulate_tty=True,
-            # The sonars are reached over the vehicle network, so a node that
-            # starts before they are reachable exits and is retried.
+            # Device outages recover inside their own connection workers.
+            # Respawn is a fallback for process failures.
             respawn=True,
             respawn_delay=30.0,
             parameters=[_parameters()],

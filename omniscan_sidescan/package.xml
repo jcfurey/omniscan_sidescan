@@ -13,6 +13,7 @@
   <buildtool_depend>ament_cmake_python</buildtool_depend>
 
   <depend>omniscan_sidescan_msgs</depend>
+  <depend>diagnostic_msgs</depend>
   <depend>rcl_interfaces</depend>
   <depend>rclpy</depend>
 

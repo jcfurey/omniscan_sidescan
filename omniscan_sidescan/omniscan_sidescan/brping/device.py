@@ -14,8 +14,9 @@ this directory.  Two deliberate changes from upstream:
   Omniscan 450 is reached over TCP (or UDP) on the vehicle network.
 """
 
-import socket
+import errno
 import select
+import socket
 import time
 from collections import deque
 
@@ -41,6 +42,12 @@ class PingDevice(object):
         self.server_address = None
         self._is_stream = False
         self._write_timeout = 5.0
+        self.cancel_event = None
+        self.clock_ns = time.time_ns
+
+    def _check_cancelled(self):
+        if self.cancel_event is not None and self.cancel_event.is_set():
+            raise ConnectionError('Device operation cancelled.')
 
     def connect_tcp(self, host=None, port=51200, timeout=5.0):
         """Connect to the device over TCP.
@@ -55,22 +62,40 @@ class PingDevice(object):
 
         self.close()
         self.server_address = (host, port)
-        sock = None
-        try:
-            # create_connection handles DNS as well as IPv4/IPv6 and closes
-            # failed address attempts internally.
-            sock = socket.create_connection(self.server_address, timeout)
-            sock.setblocking(False)
-        except socket.timeout:
-            raise ConnectionError(
-                "Connection to %s:%d timed out after %s seconds"
-                % (host, port, timeout))
-        except OSError as exception:
-            if sock is not None:
+        deadline = time.monotonic() + timeout
+        last_error = None
+        # DNS resolution follows the operating system's resolver policy.
+        for family, socktype, protocol, _, address in socket.getaddrinfo(
+                host, port, type=socket.SOCK_STREAM):
+            self._check_cancelled()
+            sock = socket.socket(family, socktype, protocol)
+            try:
+                sock.setblocking(False)
+                result = sock.connect_ex(address)
+                if result not in (0, errno.EINPROGRESS, errno.EWOULDBLOCK,
+                                  errno.EALREADY, errno.EINTR):
+                    raise OSError(result, 'connect failed')
+                while result:
+                    self._check_cancelled()
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        raise TimeoutError('TCP connect deadline expired')
+                    _, writable, exceptional = select.select(
+                        [], [sock], [sock], min(0.1, remaining))
+                    if writable or exceptional:
+                        result = sock.getsockopt(socket.SOL_SOCKET, socket.SO_ERROR)
+                        if result:
+                            raise OSError(result, 'connect failed')
+                        break
+                self._check_cancelled()
+                break
+            except OSError as exception:
                 sock.close()
+                last_error = exception
+        else:
             raise ConnectionError(
-                "Failed to open TCP connection to %s:%d: %s"
-                % (host, port, exception))
+                'Failed to open TCP connection to %s:%d: %s'
+                % (host, port, last_error or 'no addresses found'))
 
         self.iodev = sock
         self.server_address = self.iodev.getpeername()
@@ -118,30 +143,16 @@ class PingDevice(object):
             raise ConnectionError(
                 "IO device is null, configure a connection before reading.")
 
-        buffer_size = 4096
-        while True:
-            try:
-                data = self.iodev.recv(buffer_size)
-
-                if not data:
-                    # An empty recv() on a stream socket means the peer closed.
-                    if self._is_stream:
-                        raise ConnectionError("TCP connection closed by peer.")
-                    break
-
-                # extendleft() reverses the chunk and pop() takes from the
-                # right, so the two together preserve arrival order.
-                self._input_buffer.extendleft(data)
-
-                if len(data) < buffer_size:
-                    break
-
-            except BlockingIOError:
-                # Nothing available yet; normal for a non-blocking socket.
-                break
-            except OSError as exception:
-                raise ConnectionError(
-                    "Failed to read from socket: %s" % exception)
+        self._check_cancelled()
+        try:
+            data = self.iodev.recv(4096)
+            if not data and self._is_stream:
+                raise ConnectionError('TCP connection closed by peer.')
+            self._input_buffer.extendleft(data)
+        except BlockingIOError:
+            pass
+        except OSError as exception:
+            raise ConnectionError('Failed to read from socket: %s' % exception)
 
     def read(self):
         """Consume rx buffer data until a message is decoded.
@@ -150,7 +161,12 @@ class PingDevice(object):
         data left in the buffer, so subsequent calls may return further
         messages -- or None if the buffer runs dry first.
         """
-        self.read_io()
+        self._check_cancelled()
+        self.parser.expire()
+        # Consume the existing chunk before accepting more bytes. The queue
+        # stays bounded even when the peer is continuously readable.
+        if not self._input_buffer:
+            self.read_io()
         while len(self._input_buffer):
             b = self._input_buffer.pop()
 
@@ -179,6 +195,9 @@ class PingDevice(object):
         written = 0
 
         while view:
+            self._check_cancelled()
+            if time.monotonic() >= deadline:
+                raise ConnectionError('Timed out while writing to the device.')
             try:
                 sent = self.iodev.send(view)
             except BlockingIOError:
@@ -187,8 +206,8 @@ class PingDevice(object):
                     raise ConnectionError(
                         "Timed out while writing to the device.")
                 _, writable, _ = select.select(
-                    [], [self.iodev], [], remaining)
-                if not writable:
+                    [], [self.iodev], [], min(0.1, remaining))
+                if not writable and time.monotonic() >= deadline:
                     raise ConnectionError(
                         "Timed out while writing to the device.")
                 continue
@@ -208,15 +227,20 @@ class PingDevice(object):
         if self.iodev is None:
             raise ConnectionError(
                 "IO device is null, configure a connection before reading.")
-        try:
-            readable, _, exceptional = select.select(
-                [self.iodev], [], [self.iodev], max(0.0, timeout))
-        except (OSError, ValueError) as exception:
-            raise ConnectionError(
-                "Failed while waiting for socket data: %s" % exception)
-        if exceptional:
-            raise ConnectionError("Socket reported an exceptional condition.")
-        return bool(readable)
+        deadline = time.monotonic() + max(0.0, timeout)
+        while True:
+            self._check_cancelled()
+            remaining = max(0.0, deadline - time.monotonic())
+            try:
+                readable, _, exceptional = select.select(
+                    [self.iodev], [], [self.iodev], min(0.1, remaining))
+            except (OSError, ValueError) as exception:
+                raise ConnectionError(
+                    'Failed while waiting for socket data: %s' % exception)
+            if exceptional:
+                raise ConnectionError('Socket reported an exceptional condition.')
+            if readable or time.monotonic() >= deadline:
+                return bool(readable)
 
     def initialize(self):
         """Return True if the device replies to a protocol version request."""

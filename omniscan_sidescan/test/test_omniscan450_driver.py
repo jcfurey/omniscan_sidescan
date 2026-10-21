@@ -4,10 +4,12 @@
 from dataclasses import FrozenInstanceError
 import time
 
-from omniscan_sidescan.brping import definitions, Omniscan450, PingDevice
+from omniscan_sidescan.brping import definitions, Omniscan450, PingDevice, PingMessage
 from omniscan_sidescan.omniscan450_driver import (
     Omniscan450Driver,
+    SonarConfigurationError,
     SonarConnectionError,
+    SonarDataError,
     SonarError,
     SonarParams,
 )
@@ -261,6 +263,7 @@ def test_sonar_params_field_names_match_the_dataclass():
 @pytest.mark.parametrize('kwargs', [
     {'speed_of_sound_mm': 1},
     {'length_mm': 300001},
+    {'length_mm': 0},
     {'gain_index': 8},
     {'num_results': 199},
     {'pulse_len_percent': float('nan')},
@@ -275,3 +278,82 @@ def test_sonar_params_are_immutable():
 
     with pytest.raises(FrozenInstanceError):
         params.length_mm = 9000
+
+
+@pytest.mark.parametrize('mode', ['nack', 'ignore'])
+def test_rejected_configuration_never_becomes_confirmed(
+        driver, simulator, monkeypatch, mode):
+    original = simulator._handle_message
+
+    def reject(connection, message):
+        if message.message_id == 2197 and message.length_mm == 7000 and message.enable:
+            if mode == 'nack':
+                response = PingMessage(definitions.COMMON_NACK)
+                response.nacked_id = 2197
+                response.nack_message = b'unsupported range'
+                connection.sendall(response.pack_msg_data())
+            return
+        original(connection, message)
+
+    monkeypatch.setattr(simulator, '_handle_message', reject)
+    driver.configuration_timeout = 0.15
+    previous = driver.params
+    started = time.monotonic()
+    with pytest.raises(SonarConfigurationError):
+        driver.set_parameters(SonarParams(length_mm=7000))
+    assert time.monotonic() - started < 0.8
+    assert driver.params == previous
+    # An uncertain connection cannot expose profiles as if settings succeeded.
+    with pytest.raises(SonarConnectionError):
+        driver.get_data()
+
+
+def test_speed_of_sound_must_be_visible_in_a_returned_profile(simulator, monkeypatch):
+    original = simulator._handle_message
+
+    def ignore_speed(connection, message):
+        if message.message_id != 116:
+            original(connection, message)
+
+    monkeypatch.setattr(simulator, '_handle_message', ignore_speed)
+    with pytest.raises(SonarConfigurationError, match='did not appear'):
+        Omniscan450Driver(
+            ip_address=simulator.address[0], port=simulator.address[1],
+            params=SonarParams(speed_of_sound_mm=1500000),
+            configuration_timeout=0.15)
+
+
+@pytest.mark.parametrize('field,value', [
+    ('length_mm', 0),
+    ('sos_dmps', 0),
+    ('gain_index', 8),
+    ('analog_gain', float('nan')),
+    ('vehicle_heading_deg', float('inf')),
+    ('pulse_duration_sec', -1.0),
+    ('num_results', 1201),
+])
+def test_invalid_profiles_are_rejected_before_ros_assignment(
+        driver, simulator, monkeypatch, field, value):
+    profile = PingMessage(msg_data=simulator._build_profile())
+    assert Omniscan450._unpack_profile(profile)
+    setattr(profile, field, value)
+    monkeypatch.setattr(driver.omniscan450, 'wait_message', lambda *a, **k: profile)
+    with pytest.raises(SonarDataError):
+        driver.get_data()
+
+
+def test_external_configuration_drift_is_reported(driver, simulator, monkeypatch):
+    profile = PingMessage(msg_data=simulator._build_profile())
+    assert Omniscan450._unpack_profile(profile)
+    profile.length_mm = 9000
+    monkeypatch.setattr(driver.omniscan450, 'wait_message', lambda *a, **k: profile)
+    with pytest.raises(SonarConfigurationError, match='confirmed settings'):
+        driver.get_data()
+
+
+def test_finite_analog_gain_does_not_assume_undocumented_units(driver, simulator, monkeypatch):
+    profile = PingMessage(msg_data=simulator._build_profile())
+    assert Omniscan450._unpack_profile(profile)
+    profile.analog_gain = 0.0
+    monkeypatch.setattr(driver.omniscan450, 'wait_message', lambda *a, **k: profile)
+    assert driver.get_data()[0].analog_gain == 0.0

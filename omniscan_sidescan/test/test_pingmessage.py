@@ -3,7 +3,7 @@
 
 import struct
 
-from omniscan_sidescan.brping import definitions, PingMessage, PingParser
+from omniscan_sidescan.brping import definitions, Omniscan450, PingMessage, PingParser
 
 import pytest
 
@@ -151,8 +151,10 @@ def test_parser_rejects_a_known_message_with_the_wrong_payload_length():
     malformed = body + struct.pack('<H', sum(body) & 0xffff)
     parser = PingParser()
 
-    assert feed(parser, malformed) == PingParser.ERROR
-    assert parser.errors == 1
+    feed(parser, malformed)
+    assert parser.parsed == 0
+    assert parser.errors >= 1
+    assert feed(parser, msg.msg_data) == PingParser.NEW_MESSAGE
 
 
 def test_variable_length_text_message_round_trips():
@@ -196,3 +198,39 @@ def test_parser_handles_back_to_back_messages():
 def test_unknown_message_id_raises_on_construction():
     with pytest.raises(KeyError):
         PingMessage(9999)
+
+
+def test_speed_of_sound_matches_an_independent_cerulean_wire_fixture():
+    class CaptureSocket:
+
+        def __init__(self):
+            self.data = bytearray()
+
+        def send(self, data):
+            self.data.extend(data)
+            return len(data)
+
+    sonar = Omniscan450()
+    sonar.iodev = CaptureSocket()
+    sonar.control_set_speed_of_sound(1500000)
+    # BR, payload size 4, command 116, source/destination 0, 1500000 mm/s,
+    # and checksum 613. These bytes are independent of the local definitions.
+    assert sonar.iodev.data == bytes.fromhex('425204007400000060e316006502')
+
+
+def test_invalid_length_does_not_consume_the_next_valid_profile():
+    parser = PingParser()
+    damaged = b'BR' + struct.pack('<HHBB', 65535, 2198, 0, 0)
+    profile = build_profile(num_results=1200)
+    assert feed(parser, damaged + profile.msg_data) == PingParser.NEW_MESSAGE
+    assert parser.parsed == 1
+    assert parser.errors >= 1
+
+
+def test_incomplete_frame_expires_before_a_new_packet_is_read():
+    parser = PingParser()
+    profile = build_profile(num_results=200)
+    feed(parser, profile.msg_data[:15])
+    assert parser.expire(now=parser.frame_started + 1.1)
+    assert feed(parser, profile.msg_data) == PingParser.NEW_MESSAGE
+    assert parser.errors == 1

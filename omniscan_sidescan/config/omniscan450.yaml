@@ -13,27 +13,39 @@
     # here or on the command line, not at run time.
     port_ip_address: "192.168.2.94"
     port_port: 51200
+    port_frame_id: "sonar_port"
     starboard_ip_address: "192.168.2.95"
     starboard_port: 51200
+    starboard_frame_id: "sonar_starboard"
     # Only used by the four-sonar node.
     bow_ip_address: "192.168.2.93"
     bow_port: 51200
+    bow_frame_id: "sonar_bow"
     stern_ip_address: "192.168.2.92"
     stern_port: 51200
+    stern_frame_id: "sonar_stern"
 
     frame_id: "sonar"
-    # Seconds to wait while opening each sonar connection at startup.
+    # Connection and recovery are independent for each sonar.
     connect_timeout: 5.0
+    # Deadline for device information and profile configuration confirmation.
+    configuration_timeout: 2.0
     # Seconds to wait for a profile from each sonar before reporting a miss.
     read_timeout: 0.5
-    # Exit for launch respawn after this many failures; 0 disables the limit.
+    # Reconnect only this channel after this many failures; 0 disables the limit.
     max_consecutive_failures: 10
+    reconnect_initial_delay: 0.25
+    reconnect_max_delay: 10.0
+    # Based on host receive times, without assuming synchronized device clocks.
+    max_profile_age: 0.5
+    max_profile_skew: 0.05
 
     # Tunables; these can be changed while the node runs with
-    # `ros2 param set`, and apply to every sonar the node owns.
+    # `ros2 param set`. Each worker confirms settings independently; inspect
+    # diagnostics for desired/applied generations and device rejection errors.
     speed_of_sound_mm: 1482000    # 1482000 - 1500000
     start_mm: 0                   # 0 - 5000
-    length_mm: 6000               # 0 - 300000
+    length_mm: 6000               # 1 - 300000
     msec_per_ping: 0              # 0 - 10, 0 for the best ping rate
     pulse_len_percent: 0.002      # 0.002 - 0.004
     filter_duration_percent: 0.0015   # 0.0015 - 0.0016

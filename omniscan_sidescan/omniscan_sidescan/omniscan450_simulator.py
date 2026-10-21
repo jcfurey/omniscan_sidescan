@@ -32,6 +32,9 @@ DEVICE_REVISION = 1
 FIRMWARE_VERSION = (1, 2, 3)
 
 PROTOCOL_VERSION = (1, 0, 0)
+# Independent API value: do not derive the simulated command ID from the
+# driver's generated definitions, which previously hid a protocol mismatch.
+WIRE_SET_SPEED_OF_SOUND = 116
 
 
 class Omniscan450Simulator(object):
@@ -67,6 +70,7 @@ class Omniscan450Simulator(object):
         self.enabled = False
 
         self.ping_number = 0
+        self._power_on = time.monotonic()
 
         self._server = None
         self._thread = None
@@ -164,7 +168,7 @@ class Omniscan450Simulator(object):
             self.gain_index = msg.gain_index
             self.num_results = msg.num_results
             self.enabled = bool(msg.enable)
-        elif msg.message_id == definitions.OMNISCAN450_SET_SPEED_OF_SOUND:
+        elif msg.message_id == WIRE_SET_SPEED_OF_SOUND:
             self.speed_of_sound_mm = msg.speed_of_sound
 
     def _handle_request(self, connection, requested_id):
@@ -200,7 +204,7 @@ class Omniscan450Simulator(object):
         msg.ping_number = self.ping_number
         msg.start_mm = self.start_mm
         msg.length_mm = self.length_mm
-        msg.timestamp_ms = int(time.monotonic() * 1000) & 0xffffffff
+        msg.timestamp_ms = int((time.monotonic() - self._power_on) * 1000) & 0xffffffff
         msg.ping_hz = 450000
         msg.gain_index = max(self.gain_index, 0)
         msg.num_results = self.num_results
@@ -217,7 +221,7 @@ class Omniscan450Simulator(object):
         msg.pwr_results = self._synthetic_returns()
         msg.pack_msg_data()
 
-        self.ping_number += 1
+        self.ping_number = (self.ping_number + 1) & 0xffffffff
         return msg.msg_data
 
     def _synthetic_returns(self):

@@ -98,9 +98,12 @@ payload_dict_common = {
 
 # Omniscan 450 specific messages.
 OMNISCAN450_JSON_WRAPPER = 10
-OMNISCAN450_SET_SPEED_OF_SOUND = 1002
+# Cerulean API and ping-protocol/src/definitions/omniscan450.json.
+# 1002 belongs to other Ping devices, not the Omniscan 450.
+OMNISCAN450_SET_SPEED_OF_SOUND = 116
 OMNISCAN450_OS_PING_PARAMS = 2197
 OMNISCAN450_OS_MONO_PROFILE = 2198
+OMNISCAN450_MAX_RESULTS = 1200
 
 payload_dict_omniscan450 = {
     OMNISCAN450_JSON_WRAPPER: {
