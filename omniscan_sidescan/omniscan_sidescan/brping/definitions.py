@@ -101,11 +101,25 @@ OMNISCAN450_JSON_WRAPPER = 10
 # Cerulean API and ping-protocol/src/definitions/omniscan450.json.
 # 1002 belongs to other Ping devices, not the Omniscan 450.
 OMNISCAN450_SET_SPEED_OF_SOUND = 116
+OMNISCAN450_SYNC_CHANNEL_NUMBER = 169
+OMNISCAN450_SET_SYNC_CHANNEL_NUMBER = 170
 OMNISCAN450_OS_PING_PARAMS = 2197
 OMNISCAN450_OS_MONO_PROFILE = 2198
 OMNISCAN450_MAX_RESULTS = 1200
 
 payload_dict_omniscan450 = {
+    OMNISCAN450_SYNC_CHANNEL_NUMBER: {
+        "name": "sync_channel_number",
+        "format": "BB",
+        "field_names": ("channel_number", "number_of_channels"),
+        "payload_length": 2,
+    },
+    OMNISCAN450_SET_SYNC_CHANNEL_NUMBER: {
+        "name": "set_sync_channel_number",
+        "format": "BB",
+        "field_names": ("channel_number", "number_of_channels"),
+        "payload_length": 2,
+    },
     OMNISCAN450_JSON_WRAPPER: {
         "name": "JSON_WRAPPER",
         "format": "",

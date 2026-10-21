@@ -51,7 +51,7 @@ PARAMETER_LIMITS = {
     'speed_of_sound_mm': (1482000, 1500000),
     'start_mm': (0, 5000),
     'length_mm': (1, 300000),
-    'msec_per_ping': (0, 10),
+    'msec_per_ping': (0, 0xffffffff),
     'pulse_len_percent': (0.002, 0.004),
     'filter_duration_percent': (0.0015, 0.0016),
     'gain_index': (-1, 7),

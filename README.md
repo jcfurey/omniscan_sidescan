@@ -10,8 +10,8 @@ Sonar](https://bluerobotics.com/store/the-reef/cerulean-sidescan-sonar/).
 The runtime driver is C++20, using `rclcpp`, lifecycle nodes, and composable
 components. Each sonar has its own TCP worker, parser, configuration state, and
 reconnect backoff. Network waits run outside the ROS executor. The native
-protocol/transport code uses the C++ standard library and Linux/POSIX sockets;
-it has no Python or vendor SDK dependency.
+protocol/transport code uses the C++ standard library, Linux/POSIX sockets, and
+c-ares for cancellable DNS; it has no Python or vendor SDK dependency.
 
 Python remains available for the TCP simulator, integration tests, launch
 files, and the previous driver as a comparison baseline. The simulator and
@@ -41,9 +41,15 @@ repository root, so colcon finds them directly:
 mkdir -p ~/ros2_ws/src && cd ~/ros2_ws/src
 git clone -b <this branch> <this repository>
 cd ~/ros2_ws
+sudo apt-get install libc-ares-dev
+rosdep install --from-paths src --ignore-src -y --skip-keys libc-ares-dev
 colcon build --packages-up-to omniscan_sidescan --cmake-args -DCMAKE_BUILD_TYPE=RelWithDebInfo
 source install/setup.bash
 ```
+
+c-ares 1.34 or newer is required (available on Lyrical's Ubuntu Resolute).
+There is currently no upstream rosdep key for it; `rosdep.yaml` provides a local
+rule, or use the explicit system-package installation and skip key above.
 
 ## Running
 
@@ -80,15 +86,22 @@ The existing executable and launch names now start C++. Standalone executables
 configure and activate automatically, including when a device is unavailable.
 For comparison, the previous Python executables are installed as
 `sidescansonar_node_python` and `sidescansonarall_node_python`; they accept the
-same ROS parameters and publish the same messages.
+same common tuning parameters and publish the same messages. Lifecycle,
+publication workers, cancellable DNS, and sync configuration are native features.
 
 ### Lifecycle and composition
 
 Both native nodes provide the standard lifecycle services. `deactivate` cancels
-network waits, stops streaming, and joins all workers; `activate` reconnects
-using the latest committed settings. `cleanup` releases publishers and channel
-resources. Shutdown and component destruction also join workers before their
-ROS resources are destroyed.
+network waits, stops streaming, joins acquisition workers, and drains in-flight
+publication; `activate` reconnects using the latest committed settings.
+Publication threads remain idle while configured/inactive so repeated
+activation reuses the same middleware calling threads. `cleanup`, shutdown,
+and component destruction join those threads before releasing ROS resources.
+
+Component registration lives in its own plugin library; standalone executables
+link the runtime directly. Registration storage is initialized before the
+plugin's static factories to preserve teardown order when unloading is deferred
+until process exit. A native test checks ten factory load/unmap cycles.
 
 The registered components are `omniscan_sidescan::SonarNode` (two heads) and
 `omniscan_sidescan::SonarAllNode` (four heads). Components start **unconfigured**,
@@ -168,12 +181,40 @@ all metadata from that device, and the confirmed configuration generation.
 Healthy channels continue publishing when another channel is unavailable.
 Topics are relative to the node namespace; `sensor_number` changes `450`.
 
+Each head has a dedicated publication worker; combined output and diagnostics
+have separate workers. Each worker holds at most one in-flight call and one
+replaceable latest task. DDS backpressure therefore coalesces pending data
+without blocking TCP acquisition, another head's output, or parameter services.
+Queued tasks are checked for freshness and generation before publishing;
+diagnostics count coalesced tasks and publication failures. Deactivation drops
+pending tasks and waits for in-flight calls before deactivating publishers. A
+middleware call already in progress cannot be revoked; shutdown can still wait
+for that call's middleware timeout.
+
 Each profile header records its **host receive time** in the ROS clock and its
 physical `<channel>_frame_id` (default `sonar_<channel>`). Supply mounting
 transforms in your vehicle's TF configuration. `timestamp_ms` remains the
 device's independent uptime counter; it is not converted into synchronized
 acquisition time. Receive-time skew checks cannot establish acoustic
 synchronization or compensate for network latency.
+
+To configure device synchronization, set the read-only `sync_enabled:=true`
+launch argument or parameter. The native driver sends the vendor's
+[assignment command](https://docs.ceruleansonar.com/c/cerulean-ping-protocol/general-packet-definitions/set_sync_channel_number)
+and verifies it through the
+[readback command](https://docs.ceruleansonar.com/c/cerulean-ping-protocol/general-packet-definitions/sync_channel_number)
+on every connection before enabling pinging. It assigns port channel 0
+(master), starboard 1, and, for four heads, bow 2 and stern 3, with the matching
+group size. Rejected, missing, or differing readback prevents that head from
+starting. Disabled by default, this option preserves existing device assignments.
+
+Heads must share a subnet and exchange UDP on port 51201. Device synchronization
+can make a missing head affect the whole hardware group's pinging; independent
+host recovery cannot override that device behavior. Readback proves the assigned
+group, not acoustic timing. Diagnostics expose `sync_assignment_verified` and
+explicitly leave `acoustic_timing_verified` false. Header timestamps remain host
+receipt times. See [hardware validation](docs/HARDWARE_VALIDATION.md) before
+relying on synchronized measurements for navigation.
 
 Combined output requires a new profile from every channel in the same
 configuration generation, with matching geometry, age within `max_profile_age`
@@ -206,11 +247,19 @@ ros2 param set /omniscan450all gain_index 3
 | `speed_of_sound_mm` | 1482000–1500000 | 1482000 |
 | `start_mm` | 0–5000 | 0 |
 | `length_mm` | 1–300000 | 5000 (6000 in the four-sonar launch file) |
-| `msec_per_ping` | 0–10 | 0 |
+| `msec_per_ping` | 0–4294967295 ms (wire range; constrained by timeouts below) | 0 |
 | `pulse_len_percent` | 0.002–0.004 | 0.002 |
 | `filter_duration_percent` | 0.0015–0.0016 | 0.0015 |
 | `gain_index` | -1–7 | -1 (auto) |
 | `num_results` | 200–1200 | 600 |
+
+For 10 Hz use `msec_per_ping:=100`. Both `read_timeout` and
+`configuration_timeout` must exceed the requested period in seconds; adjust
+them together with slower rates. Values inconsistent with these deadlines are
+rejected before sending commands. Other inherited bounds remain conservative
+driver policy: the vendor publishes typical pulse/filter values, rather than
+complete firmware limits, and documents `start_mm` as zero. Keep `start_mm=0`
+until your firmware's support for nonzero starts has been verified.
 
 `frame_id`, `read_timeout`, `max_profile_age`, and `max_profile_skew` are also
 settable at run time. Addresses (`<channel>_ip_address`, `<channel>_port`),
@@ -232,9 +281,14 @@ An ordered device-information reply separates old buffered profiles from this
 confirmation. Ping period and pulse/filter fractions are not reported in the
 profile and cannot be read back by this API; they remain commanded values.
 
+The profile that confirms configuration remains available to the next read,
+which can deliver it or select a newer buffered profile. This also publishes
+the first confirmed sample when the stream then pauses. Receipt timestamps,
+freshness limits, and duplicate checks apply as usual.
+
 | Connection parameter | Default | Meaning |
 | --- | --- | --- |
-| `connect_timeout` | 5.0 s | TCP connection deadline for each device |
+| `connect_timeout` | 5.0 s | Total DNS lookup and TCP connection deadline for each device |
 | `configuration_timeout` | 2.0 s | Device-information and profile-confirmation deadlines |
 | `read_timeout` | 0.5 s | Profile wait deadline for one device |
 | `max_consecutive_failures` | 10 | Reconnect this channel after persistent read/data failures; 0 disables this threshold |
@@ -244,8 +298,20 @@ profile and cannot be read back by this API; they remain commanded values.
 Socket failures, NACKs, and configuration drift reconnect the affected channel
 without waiting for the read-failure threshold. Retry settings are launch
 arguments and YAML parameters. Shutdown cancels connection/configuration/read
-waits. Hostname resolution follows the operating system's resolver policy;
-use device IP addresses when predictable cancellation is required.
+waits. Hostnames use c-ares with system DNS configuration and `/etc/hosts`;
+numeric IPv4/IPv6 addresses bypass DNS. Lookup and TCP connect share one
+`connect_timeout` budget, and cancellation/settings changes are checked at most
+every 50 ms. No blocking resolver helper thread survives a cancelled lookup.
+Custom NSS modules such as mDNS are not used; use DNS, `/etc/hosts`, or a numeric
+address for those devices.
+
+Closing a connection sends a best-effort stop command with a 100 ms cleanup
+deadline whenever a start command was sent, including startup that timed out or
+was cancelled before confirmation. The stop uses confirmed settings when
+available, falling back to the commanded settings during unconfirmed startup.
+It then half-closes writes and drains incoming bytes within that same budget
+to avoid discarding a queued stop when closing a busy TCP stream. Diagnostics
+only report settings as applied after confirmation.
 
 The native driver checks for superseded settings during profile and
 configuration waits. Changing `read_timeout` also interrupts the previous read
@@ -259,6 +325,9 @@ finish before the new settings are applied.
 Incomplete frames expire after one second, including during silent TCP reads
 with longer timeouts. Profiles recovered behind a truncated frame retain their
 original host receipt timestamps and remain subject to the normal age limit.
+When a complete final profile precedes EOF or a socket error, it is validated
+and delivered once. The next operation reports the broken stream and recovers
+that head. Invalid profiles and NACKs retain their normal error behavior.
 
 ## Testing
 
@@ -269,24 +338,58 @@ colcon test-result --all
 
 Native GTests cover independent command/profile fixtures, framing recovery,
 bounded buffering, power scaling, parameter validation, and lifecycle setup.
+Randomized chunk boundaries exercise 500 mixed frames and their receipt times.
+Scaling checks cover 200/600/1200 samples, constant and extreme finite dB ranges,
+monotonic output, and exact endpoints using C++20 linear interpolation.
 Python integration tests run the installed C++ executables through TCP and DDS,
 checking both legacy message variants, all per-head topics, oldest receipt
 stamps, rejected/ignored settings, independent outages, malformed profiles,
 configuration drift, counter wrap/reboots/duplicates, lifecycle reactivation,
 component load/unload with intra-process enabled, and cancellation of long
 waits. The Python reference driver's regression suite is also retained.
+Component tests cover isolated single-threaded and shared multithreaded
+containers. An injected stall at `rcl_publish` verifies that acquisition,
+other outputs, diagnostics, and parameter services remain responsive.
+Local DNS fixtures cover successful replies, deadlines, and cancellation of
+four concurrent lookups. Deterministic EOF tests gate the native read until
+both the final packet and FIN are available, including malformed, truncated,
+NACK, and multiple-profile cases.
 
 Additional native tests cover superseding 60-second reads/configuration waits,
 long retry backoff, fragmented TCP traffic, continuous malformed input, rapid
 parameter updates, silent truncated-frame recovery, and repeated lifecycle
 cleanup. Lifecycle tests check that threads and descriptors are released.
-A ROS-independent channel stress helper
-runs four concurrent snapshot readers while applying 60 configuration updates
+Startup fault tests cover missing information replies and malformed profiles
+during deactivation, shutdown, component unload, SIGINT/SIGTERM, and retry backoff.
+Repeated four-head reconnect/deactivate cycles check delivery of stop commands.
+Paused-stream tests check that configuration-confirming profiles are delivered
+once after activation and parameter changes.
+A ROS-independent channel stress helper runs four concurrent snapshot readers
+while applying 60 configuration updates
 and starting and stopping all four workers three times. It can also be built
 with thread, address, and undefined-behavior sanitizers.
 
 These tests use simulated devices; on-hardware firmware and timing validation
-is still required.
+is still required; follow [the validation procedure](docs/HARDWARE_VALIDATION.md).
+
+GitHub Actions is configured to build and run the suite on Lyrical with Fast DDS and Cyclone
+DDS, checks the native core with sanitizers, and runs a multithreaded component
+soak. A manual workflow run can extend the soak to an hour. The workflow must
+run in GitHub before its remote results can be claimed.
+
+### Repeatable soak
+
+From `omniscan_sidescan/`, after building and sourcing the workspace:
+
+```
+python3 test/soak_driver.py --seconds 3600 --component multi-threaded --report /tmp/omniscan-soak.json
+```
+
+This rotates four-head checksum failures, verifies healthy heads never
+reconnect because of a peer fault, changes range/sample count/gain/sound speed,
+and cycles activation while checking stop commands, profile consistency,
+descriptor/thread counts, and resident-memory growth. JSON records baseline,
+peak, and final resources. It is a simulator soak, not vehicle qualification.
 
 ### Native stress with sanitizers
 
@@ -295,7 +398,7 @@ After sourcing the workspace, run from `omniscan_sidescan/`:
 ```
 g++ -std=c++20 -O1 -g -fsanitize=thread -fno-omit-frame-pointer \
     -I include test/channel_stress.cpp src/channel.cpp src/connection.cpp src/protocol.cpp \
-    -pthread -o /tmp/omniscan-channel-tsan
+    src/resolver.cpp -pthread -lcares -o /tmp/omniscan-channel-tsan
 OMNISCAN_CHANNEL_STRESS_EXECUTABLE=/tmp/omniscan-channel-tsan \
     TSAN_OPTIONS=halt_on_error=1 python3 -m pytest test/test_channel_stress.py -q
 ```
@@ -327,13 +430,13 @@ and observer CPU are excluded. This measures host processing cost, not the
 physical sonar's achievable ping rate or acoustic synchronization.
 
 On a Threadripper 3970X running ROS 2 Lyrical, GCC 15.2, and a
-`RelWithDebInfo` build, three 10-second runs of that workload measured these
+`RelWithDebInfo` build using Cyclone DDS, three 10-second runs measured these
 medians:
 
 | Driver | CPU (% of one core) | Resident memory | Combined sets/s |
 | --- | --- | --- | --- |
-| C++ | 1.30% | 20.3 MiB | 19.50 |
-| Python reference | 10.50% | 65.3 MiB | 19.50 |
+| C++ | 1.40% | 20.6 MiB | 19.60 |
+| Python reference | 10.70% | 65.5 MiB | 19.50 |
 
 The simulator's requested rate is 20 Hz; its scheduling and packet-generation
 overhead account for the observed rate being slightly lower. These are local

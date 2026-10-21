@@ -4,10 +4,13 @@
 
 #include <gtest/gtest.h>
 
+#include <algorithm>
 #include <array>
 #include <bit>
+#include <cmath>
 #include <limits>
 #include <random>
+#include <utility>
 
 namespace os = omniscan_sidescan;
 namespace wire = omniscan_sidescan::protocol;
@@ -76,6 +79,32 @@ TEST(Protocol, PingCommandLayoutAndDisable)
   EXPECT_EQ(wire::ping_command(params)[40], 1);
 }
 
+TEST(Protocol, SyncCommandsMatchIndependentVendorLayout)
+{
+  EXPECT_EQ(wire::sync_command(0, 4), (std::vector<uint8_t>{
+    0x42, 0x52, 2, 0, 0xaa, 0, 0, 0, 0, 4, 0x44, 1}));
+  EXPECT_EQ(wire::request(169), (std::vector<uint8_t>{
+    0x42, 0x52, 2, 0, 6, 0, 0, 0, 0xa9, 0, 0x45, 1}));
+  EXPECT_THROW(wire::sync_command(4, 4), std::invalid_argument);
+  EXPECT_THROW(wire::sync_command(0, 0), std::invalid_argument);
+}
+
+TEST(Protocol, PingPeriodUsesFullUnsigned32BitWireRange)
+{
+  os::Params params;
+  for (const int64_t period : {100LL, 1000LL, 4294967295LL}) {
+    params.msec_per_ping = period;
+    auto bytes = wire::ping_command(params);
+    const auto low = wire::u16(bytes, 16);
+    const auto high = wire::u16(bytes, 18);
+    EXPECT_EQ(static_cast<uint64_t>(low) + (static_cast<uint64_t>(high) << 16), period);
+  }
+  params.msec_per_ping = 4294967296LL;
+  EXPECT_THROW(params.validate(), std::invalid_argument);
+  params.msec_per_ping = -1;
+  EXPECT_THROW(params.validate(), std::invalid_argument);
+}
+
 TEST(Protocol, IndependentProfileFixtureAndScaling)
 {
   const auto fixture = profile_fixture();
@@ -125,6 +154,97 @@ TEST(Protocol, RejectsInvalidSamplesAndNonfiniteMetadata)
     }
     EXPECT_THROW(wire::decode_profile(packet), os::DataError) << offset;
   }
+}
+
+TEST(Protocol, PowerScalingStaysBoundedAcrossFiniteRangesAndSampleCounts)
+{
+  const auto large = std::numeric_limits<float>::max();
+  const auto small = std::numeric_limits<float>::denorm_min();
+  const std::array<std::pair<float, float>, 8> ranges{{
+    {-90, 0}, {-123.456f, -10.2f}, {5, 5}, {-large, large},
+    {-large, 0}, {0, small}, {-large, small}, {-90, 0.00000001f}}};
+  for (const uint16_t count : {200, 600, 1200}) {
+    for (const auto & [low, high] : ranges) {
+      auto packet = profile_fixture();
+      packet.payload.resize(52 + 2 * count);
+      packet.payload[22] = static_cast<uint8_t>(count);
+      packet.payload[23] = static_cast<uint8_t>(count >> 8);
+      const auto store_float = [&packet](size_t offset, float value) {
+          const auto bits = std::bit_cast<uint32_t>(value);
+          for (size_t i = 0; i < 4; ++i) {
+            packet.payload[offset + i] = static_cast<uint8_t>(bits >> (8 * i));
+          }
+        };
+      store_float(36, high);
+      store_float(40, low);
+      for (size_t i = 0; i < count; ++i) {
+        const auto raw = static_cast<uint16_t>(i * 65535 / (count - 1));
+        packet.payload[52 + 2 * i] = static_cast<uint8_t>(raw);
+        packet.payload[53 + 2 * i] = static_cast<uint8_t>(raw >> 8);
+      }
+      const auto profile = wire::decode_profile(packet);
+      EXPECT_EQ(profile.scaled.front(), low);
+      EXPECT_EQ(profile.scaled.back(), high);
+      for (size_t i = 0; i < count; ++i) {
+        EXPECT_EQ(profile.raw[i], i * 65535 / (count - 1));
+        EXPECT_TRUE(std::isfinite(profile.scaled[i]));
+        EXPECT_GE(profile.scaled[i], low);
+        EXPECT_LE(profile.scaled[i], high);
+        if (i) {EXPECT_GE(profile.scaled[i], profile.scaled[i - 1]);}
+      }
+    }
+  }
+}
+
+TEST(Protocol, RandomChunkBoundariesPreserveFramesAndOriginalReceiptTimes)
+{
+  struct Expected {uint16_t id; std::vector<uint8_t> payload; size_t end;};
+  const std::array<std::pair<uint16_t, size_t>, 6> shapes{{
+    {4, 6}, {2, 4096}, {3, 0}, {10, 1024}, {2198, 452}, {2198, 2452}}};
+  std::mt19937 rng(2198);
+  std::vector<Expected> expected;
+  std::vector<uint8_t> stream;
+  for (size_t i = 0; i < 500; ++i) {
+    // Non-header noise exercises synchronization without inventing packets.
+    for (size_t noise = rng() % 17; noise > 0; --noise) {
+      stream.push_back(static_cast<uint8_t>(rng() % 64));
+    }
+    const auto [id, size] = shapes[rng() % shapes.size()];
+    std::vector<uint8_t> payload(size);
+    for (auto & byte : payload) {
+      byte = static_cast<uint8_t>(rng());
+    }
+    const auto frame = wire::encode(id, payload);
+    stream.insert(stream.end(), frame.begin(), frame.end());
+    expected.push_back({id, std::move(payload), stream.size()});
+  }
+  wire::Parser parser;
+  auto received = os::SteadyClock::now();
+  int64_t stamp = 77000000;
+  size_t delivered = 0;
+  for (size_t cursor = 0; cursor < stream.size(); ) {
+    const auto count = std::min<size_t>(stream.size() - cursor, 1 + rng() % 5000);
+    received += std::chrono::milliseconds(1);
+    stamp += 1000000;
+    const auto packets = parser.feed(std::span(stream).subspan(cursor, count), received, stamp);
+    for (const auto & packet : packets) {
+      ASSERT_LT(delivered, expected.size());
+      const auto & frame = expected[delivered++];
+      EXPECT_GT(frame.end, cursor);
+      EXPECT_LE(frame.end, cursor + count);
+      EXPECT_EQ(packet.id, frame.id);
+      EXPECT_EQ(packet.payload, frame.payload);
+      EXPECT_EQ(packet.received, received);
+      EXPECT_EQ(packet.timestamp_ns, stamp);
+    }
+    cursor += count;
+    EXPECT_LE(parser.buffered_bytes(), 4105u);
+    EXPECT_TRUE(parser.feed({}, received, stamp + 1).empty());
+  }
+  EXPECT_EQ(delivered, expected.size());
+  EXPECT_EQ(parser.errors(), 0u);
+  EXPECT_EQ(parser.buffered_bytes(), 0u);
+  EXPECT_FALSE(parser.assembly_deadline());
 }
 
 TEST(Protocol, FragmentationCoalescingChecksumAndResynchronization)

@@ -14,6 +14,7 @@ ARGUMENTS = (
     ('starboard_ip_address', '192.168.2.95', 'address of the starboard sonar'),
     ('starboard_port', '51200', 'TCP port of the starboard sonar'),
     ('frame_id', 'sonar', 'frame_id stamped on published messages'),
+    ('sync_enabled', 'false', 'assign and verify the device acoustic sync group'),
     ('port_frame_id', 'sonar_port', 'physical frame of the port sonar'),
     ('starboard_frame_id', 'sonar_starboard', 'physical frame of the starboard sonar'),
     ('connect_timeout', '5.0', 'seconds to wait for each TCP connection'),
@@ -59,6 +60,8 @@ def _parameters():
             parameters[name] = ParameterValue(configuration, value_type=int)
         elif name in FLOAT_PARAMETERS:
             parameters[name] = ParameterValue(configuration, value_type=float)
+        elif name == 'sync_enabled':
+            parameters[name] = ParameterValue(configuration, value_type=bool)
         else:
             parameters[name] = configuration
     return parameters

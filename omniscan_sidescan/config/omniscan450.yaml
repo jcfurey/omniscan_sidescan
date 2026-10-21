@@ -26,6 +26,9 @@
     stern_frame_id: "sonar_stern"
 
     frame_id: "sonar"
+    # Opt in only when all heads share a subnet and UDP 51201 is available.
+    # Assignments are read back; physical acoustic timing needs hardware validation.
+    sync_enabled: false
     # Connection and recovery are independent for each sonar.
     connect_timeout: 5.0
     # Deadline for device information and profile configuration confirmation.
@@ -46,7 +49,8 @@
     speed_of_sound_mm: 1482000    # 1482000 - 1500000
     start_mm: 0                   # 0 - 5000
     length_mm: 6000               # 1 - 300000
-    msec_per_ping: 0              # 0 - 10, 0 for the best ping rate
+    msec_per_ping: 0              # uint32 ms; 100 = 10 Hz, 0 = fastest
+    # read_timeout and configuration_timeout must exceed msec_per_ping / 1000.
     pulse_len_percent: 0.002      # 0.002 - 0.004
     filter_duration_percent: 0.0015   # 0.0015 - 0.0016
     gain_index: -1                # -1 for auto gain, otherwise 0 - 7

@@ -55,6 +55,8 @@ class Omniscan450Simulator(object):
         self.bind = bind
         self.port = port
         self.channel_number = channel_number
+        self.sync_channel_number = 255
+        self.number_of_channels = 0
         self.ping_interval = ping_interval
         self.seed = seed
 
@@ -170,6 +172,13 @@ class Omniscan450Simulator(object):
             self.enabled = bool(msg.enable)
         elif msg.message_id == WIRE_SET_SPEED_OF_SOUND:
             self.speed_of_sound_mm = msg.speed_of_sound
+        elif msg.message_id == 170:
+            self.sync_channel_number = msg.channel_number
+            self.number_of_channels = msg.number_of_channels
+            self.channel_number = msg.channel_number
+            reply = PingMessage(definitions.COMMON_ACK)
+            reply.acked_id = 170
+            connection.sendall(reply.pack_msg_data())
 
     def _handle_request(self, connection, requested_id):
         if requested_id == definitions.COMMON_DEVICE_INFORMATION:
@@ -186,6 +195,10 @@ class Omniscan450Simulator(object):
              reply.version_minor,
              reply.version_patch) = PROTOCOL_VERSION
             reply.reserved = 0
+        elif requested_id == 169:
+            reply = PingMessage(169)
+            reply.channel_number = self.sync_channel_number
+            reply.number_of_channels = self.number_of_channels
         elif requested_id == definitions.OMNISCAN450_OS_MONO_PROFILE:
             connection.sendall(self._build_profile())
             return

@@ -1,10 +1,8 @@
 // Copyright 2026 The omniscan_sidescan contributors
 // SPDX-License-Identifier: MIT
 #include "omniscan_sidescan/connection.hpp"
+#include "omniscan_sidescan/resolver.hpp"
 
-#include <arpa/inet.h>
-#include <fcntl.h>
-#include <netdb.h>
 #include <poll.h>
 #include <sys/socket.h>
 #include <unistd.h>
@@ -14,7 +12,6 @@
 #include <cerrno>
 #include <cmath>
 #include <cstring>
-#include <memory>
 #include <utility>
 
 namespace omniscan_sidescan
@@ -42,6 +39,11 @@ Connection::Connection(
     !std::isfinite(options_.configuration_timeout) || options_.configuration_timeout <= 0)
   {
     throw std::invalid_argument("invalid connection options");
+  }
+  if (options_.sync &&
+    (options_.sync->count == 0 || options_.sync->channel >= options_.sync->count))
+  {
+    throw std::invalid_argument("invalid sync channel group");
   }
 }
 
@@ -79,29 +81,22 @@ bool Connection::wait(
   }
 }
 
-void Connection::connect()
+void Connection::connect(const Interrupt & interrupted)
 {
-  check_cancelled();
-  addrinfo hints{};
-  hints.ai_family = AF_UNSPEC;
-  hints.ai_socktype = SOCK_STREAM;
-  addrinfo * addresses = nullptr;
-  // Numeric addresses resolve locally. Hostnames follow the operating system
-  // resolver policy, just as the Python reference implementation does.
-  const auto result = ::getaddrinfo(
-    options_.address.c_str(), std::to_string(options_.port).c_str(), &hints, &addresses);
-  if (result != 0) {throw ConnectionError(std::string("resolve: ") + gai_strerror(result));}
-  std::unique_ptr<addrinfo, decltype(& freeaddrinfo)> resolved(addresses, freeaddrinfo);
   const auto deadline = after(options_.connect_timeout);
+  const auto addresses = resolve(options_.address, options_.port, deadline,
+      [this, &interrupted] {check_interrupted(interrupted);});
   std::string error = "TCP connect timed out";
-  for (auto * address = addresses; address; address = address->ai_next) {
-    check_cancelled();
-    socket_ = ::socket(address->ai_family, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
+  for (const auto & address : addresses) {
+    check_interrupted(interrupted);
+    if (SteadyClock::now() >= deadline) {break;}
+    socket_ = ::socket(address.address.ss_family, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
     if (socket_ < 0) {error = system_error("socket"); continue;}
     try {
-      const auto connected = ::connect(socket_, address->ai_addr, address->ai_addrlen);
+      const auto connected = ::connect(socket_,
+          reinterpret_cast<const sockaddr *>(&address.address), address.size);
       if (connected == 0) {return;}
-      if (errno == EINPROGRESS && wait(POLLOUT, deadline)) {
+      if (errno == EINPROGRESS && wait(POLLOUT, deadline, false, interrupted)) {
         int status = 0;
         socklen_t size = sizeof(status);
         if (::getsockopt(socket_, SOL_SOCKET, SO_ERROR, &status, &size) == 0 && status == 0) {
@@ -143,6 +138,7 @@ std::optional<Packet> Connection::read(
 {
   while (true) {
     check_interrupted(interrupted);
+    if (read_error_) {std::rethrow_exception(read_error_);}
     if (!pending_.empty()) {
       Packet packet = std::move(pending_.front());
       pending_.pop_front();
@@ -166,9 +162,15 @@ std::optional<Packet> Connection::read(
       if (SteadyClock::now() >= deadline && pending_.empty()) {return {};}
       continue;
     }
-    if (count == 0) {throw ConnectionError("TCP peer closed the connection");}
+    if (count == 0 || (count < 0 && errno != EINTR && errno != EAGAIN && errno != EWOULDBLOCK)) {
+      read_error_ = std::make_exception_ptr(ConnectionError(
+          count == 0 ? "TCP peer closed the connection" : system_error("recv")));
+      // A terminal error while draining must not discard the final complete
+      // profile. Deliver it once; the next operation reports the broken stream.
+      if (!block) {return {};}
+      std::rethrow_exception(read_error_);
+    }
     if (errno == EINTR) {continue;}
-    if (errno != EAGAIN && errno != EWOULDBLOCK) {throw ConnectionError(system_error("recv"));}
     if (!block) {return {};}
     // Frame assembly must expire even if the peer goes quiet during a long
     // profile/configuration wait. Keep the caller's overall deadline intact.
@@ -204,9 +206,39 @@ void Connection::initialize(const Params & params, const Interrupt & interrupted
 {
   if (socket_ >= 0) {throw std::logic_error("connection is already initialized");}
   params.validate();
-  connect();
+  parser_ = {};
+  pending_.clear();
+  read_error_ = {};
+  connect(interrupted);
   information(after(options_.configuration_timeout), interrupted);
+  synchronize(interrupted);
   configure(params, interrupted);
+}
+
+void Connection::synchronize(const Interrupt & interrupted)
+{
+  sync_verified_ = false;
+  if (!options_.sync) {return;}
+  const auto expected = *options_.sync;
+  const auto deadline = after(options_.configuration_timeout);
+  check_interrupted(interrupted);
+  write(protocol::sync_command(expected.channel, expected.count), deadline);
+  // The ordered information barrier drains any readback from an earlier
+  // session before requesting and checking this assignment explicitly.
+  information(deadline, interrupted);
+  write(protocol::request(protocol::sync_channel), deadline);
+  while (auto packet = read(deadline, true, interrupted)) {
+    check_nack(*packet);
+    if (packet->id == protocol::sync_channel) {
+      if (packet->payload[0] != expected.channel || packet->payload[1] != expected.count) {
+        throw ConfigurationError("synchronization assignment readback differs from request");
+      }
+      sync_verified_ = true;
+      return;
+    }
+    if (SteadyClock::now() >= deadline) {break;}
+  }
+  throw ConfigurationError("synchronization assignment readback timed out");
 }
 
 void Connection::configure(const Params & params, const Interrupt & interrupted)
@@ -220,7 +252,12 @@ void Connection::configure(const Params & params, const Interrupt & interrupted)
   }
   auto without_speed = params;
   without_speed.speed_of_sound_mm = params_.speed_of_sound_mm;
-  if (!configured_ || without_speed != params_) {write(protocol::ping_command(params), deadline);}
+  if (!configured_ || without_speed != params_) {
+    write(protocol::ping_command(params), deadline);
+    // The device may start pinging before it confirms the configuration.
+    // Retain the complete command for cleanup without declaring it applied.
+    commanded_ping_params_ = params;
+  }
   // An ordered request forms a stream barrier: profiles buffered before the
   // command cannot confirm it. Commands need not ACK in the vendor protocol.
   information(deadline, interrupted);
@@ -229,9 +266,14 @@ void Connection::configure(const Params & params, const Interrupt & interrupted)
     if (packet->id == protocol::mono_profile) {
       try {
         auto profile = protocol::decode_profile(*packet);
-        if (protocol::matches(profile, params)) {
+        if (protocol::matches(profile, params) &&
+          (!options_.sync || profile.channel_number == options_.sync->channel))
+        {
           params_ = params;
           configured_ = true;
+          // Confirmation is also a usable measurement. Let the next read
+          // deliver it or select a newer buffered profile, keeping its receipt.
+          pending_.push_front(std::move(*packet));
           return;
         }
       } catch (const DataError &) {
@@ -258,7 +300,9 @@ Profile Connection::read_profile(double timeout, const Interrupt & interrupted)
   }
   if (!newest) {throw TimeoutError("profile read timed out");}
   auto profile = protocol::decode_profile(*newest);
-  if (!protocol::matches(profile, params_)) {
+  if (!protocol::matches(profile, params_) ||
+    (options_.sync && profile.channel_number != options_.sync->channel))
+  {
     throw ConfigurationError("profile differs from confirmed settings");
   }
   return profile;
@@ -267,15 +311,32 @@ Profile Connection::read_profile(double timeout, const Interrupt & interrupted)
 void Connection::close() noexcept
 {
   if (socket_ < 0) {return;}
-  if (configured_) {
+  if (commanded_ping_params_) {
     try {
-      write(protocol::ping_command(params_, false), after(0.1), true);
+      // A rejected update may also be rejected with enable=false. Prefer the
+      // last confirmed parameters; startup only has its commanded parameters.
+      const auto & stop_params = configured_ ? params_ : *commanded_ping_params_;
+      const auto deadline = after(0.1);
+      write(protocol::ping_command(stop_params, false), deadline, true);
+      // Closing with unread data can reset TCP and discard the queued stop.
+      // Half-close writes, then drain until EOF within the same cleanup budget.
+      ::shutdown(socket_, SHUT_WR);
+      std::array<uint8_t, 4096> discarded{};
+      while (SteadyClock::now() < deadline) {
+        const auto count = ::recv(socket_, discarded.data(), discarded.size(), MSG_DONTWAIT);
+        if (count > 0 || (count < 0 && errno == EINTR)) {continue;}
+        if (count < 0 && (errno == EAGAIN || errno == EWOULDBLOCK) &&
+          wait(POLLIN, deadline, true)) {continue;}
+        break;
+      }
     } catch (...) {
     }
   }
   ::shutdown(socket_, SHUT_RDWR);
   ::close(socket_);
   socket_ = -1;
+  commanded_ping_params_.reset();
   configured_ = false;
+  sync_verified_ = false;
 }
 }  // namespace omniscan_sidescan

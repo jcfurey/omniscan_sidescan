@@ -57,6 +57,7 @@ bool valid_size(uint16_t id, size_t size)
     case 4: return size == 6;
     case 5: return size == 4;
     case 6: return size == 2;
+    case 169: case 170: return size == 2;
     case 100: return size == 1;
     case 116: return size == 4;
     case 2197: return size == 36;
@@ -71,7 +72,7 @@ void Params::validate() const
   limit<int64_t>("speed_of_sound_mm", speed_of_sound_mm, 1482000, 1500000);
   limit<int64_t>("start_mm", start_mm, 0, 5000);
   limit<int64_t>("length_mm", length_mm, 1, 300000);
-  limit<int64_t>("msec_per_ping", msec_per_ping, 0, 10);
+  limit<int64_t>("msec_per_ping", msec_per_ping, 0, UINT32_MAX);
   limit("pulse_len_percent", pulse_len_percent, 0.002, 0.004);
   limit("filter_duration_percent", filter_duration_percent, 0.0015, 0.0016);
   limit<int64_t>("gain_index", gain_index, -1, 7);
@@ -118,6 +119,12 @@ std::vector<uint8_t> sound_command(const Params & params)
   std::vector<uint8_t> data(4);
   put32(data, 0, static_cast<uint32_t>(params.speed_of_sound_mm));
   return encode(speed_of_sound, data);
+}
+
+std::vector<uint8_t> sync_command(uint8_t channel, uint8_t count)
+{
+  if (count == 0 || channel >= count) {throw std::invalid_argument("invalid sync channel group");}
+  return encode(set_sync_channel, std::array<uint8_t, 2>{channel, count});
 }
 
 std::vector<uint8_t> ping_command(const Params & params, bool enabled)
@@ -170,10 +177,10 @@ Profile decode_profile(const Packet & packet)
   }
   p.raw.resize(p.num_results);
   p.scaled.resize(p.num_results);
-  const double scale = (static_cast<double>(p.max_pwr_db) - p.min_pwr_db) / 65535.0;
+  const double low = p.min_pwr_db, high = p.max_pwr_db;
   for (size_t i = 0; i < p.num_results; ++i) {
     p.raw[i] = u16(d, 52 + 2 * i);
-    p.scaled[i] = static_cast<float>(p.min_pwr_db + p.raw[i] * scale);
+    p.scaled[i] = static_cast<float>(std::lerp(low, high, p.raw[i] / 65535.0));
     if (!std::isfinite(p.scaled[i])) {throw DataError("nonfinite scaled power");}
   }
   p.received = packet.received;

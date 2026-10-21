@@ -3,6 +3,7 @@
 #pragma once
 
 #include "omniscan_sidescan/channel.hpp"
+#include "omniscan_sidescan/publication.hpp"
 
 #include <diagnostic_msgs/msg/diagnostic_array.hpp>
 #include <omniscan_sidescan_msgs/msg/side_scan_sonar.hpp>
@@ -45,6 +46,8 @@ private:
   void release_resources();
   void profiles();
   void diagnostics();
+  std::vector<Publication *> publications();
+  void enqueue(Publication & output, Publication::Task task, Deadline received, double skew = 0);
   bool fresh(const ChannelSnapshot & snapshot, Deadline now) const;
   std::string combined_problem(const Snapshots & snapshots, Deadline now) const;
   Snapshots snapshots() const;
@@ -59,7 +62,11 @@ private:
   double read_timeout_{0.5}, max_age_{0.5}, max_skew_{0.05};
   std::array<uint64_t, 4> last_profile_{}, last_combined_{};
   std::atomic_bool active_{false};
+  std::atomic<uint64_t> publication_generation_{0};
+  std::atomic<double> publication_max_age_{0.5}, publication_max_skew_{0.05};
   mutable std::mutex mutex_;
+  std::vector<std::unique_ptr<Publication>> head_publications_;
+  Publication combined_publication_, diagnostics_publication_;
   std::vector<HeadPublisher::SharedPtr> head_publishers_;
   rclcpp_lifecycle::LifecyclePublisher<omniscan_sidescan_msgs::msg::SideScanSonarRaw>::SharedPtr
     raw_two_;

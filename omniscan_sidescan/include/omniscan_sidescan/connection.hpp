@@ -6,6 +6,7 @@
 
 #include <atomic>
 #include <deque>
+#include <exception>
 #include <functional>
 #include <optional>
 #include <string>
@@ -18,10 +19,12 @@ struct SettingsSuperseded : SonarError {using SonarError::SonarError;};
 
 struct ConnectionOptions
 {
+  struct Sync {uint8_t channel, count;};
   std::string address;
   uint16_t port{51200};
   double connect_timeout{5.0};
   double configuration_timeout{2.0};
+  std::optional<Sync> sync;
 };
 
 // One worker owns a Connection. No socket, parser or protocol state is shared
@@ -41,9 +44,10 @@ public:
   Profile read_profile(double timeout, const Interrupt & interrupted = {});
   void close() noexcept;
   uint64_t parser_errors() const {return parser_.errors();}
+  bool sync_verified() const {return sync_verified_;}
 
 private:
-  void connect();
+  void connect(const Interrupt & interrupted);
   void check_cancelled() const;
   void check_interrupted(const Interrupt & interrupted) const;
   bool wait(
@@ -54,6 +58,7 @@ private:
     Deadline deadline, bool block = true,
     const Interrupt & interrupted = {});
   void information(Deadline deadline, const Interrupt & interrupted = {});
+  void synchronize(const Interrupt & interrupted);
   void check_nack(const Packet & packet) const;
 
   ConnectionOptions options_;
@@ -63,6 +68,9 @@ private:
   protocol::Parser parser_;
   std::deque<Packet> pending_;
   Params params_;
+  std::exception_ptr read_error_;
+  std::optional<Params> commanded_ping_params_;
   bool configured_{false};
+  bool sync_verified_{false};
 };
 }  // namespace omniscan_sidescan

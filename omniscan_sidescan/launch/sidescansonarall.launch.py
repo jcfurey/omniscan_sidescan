@@ -18,6 +18,7 @@ ARGUMENTS = (
     ('stern_ip_address', '192.168.2.92', 'address of the stern sonar'),
     ('stern_port', '51200', 'TCP port of the stern sonar'),
     ('frame_id', 'sonar', 'frame_id stamped on published messages'),
+    ('sync_enabled', 'false', 'assign and verify the device acoustic sync group'),
     ('port_frame_id', 'sonar_port', 'physical frame of the port sonar'),
     ('starboard_frame_id', 'sonar_starboard', 'physical frame of the starboard sonar'),
     ('bow_frame_id', 'sonar_bow', 'physical frame of the bow sonar'),
@@ -65,6 +66,8 @@ def _parameters():
             parameters[name] = ParameterValue(configuration, value_type=int)
         elif name in FLOAT_PARAMETERS:
             parameters[name] = ParameterValue(configuration, value_type=float)
+        elif name == 'sync_enabled':
+            parameters[name] = ParameterValue(configuration, value_type=bool)
         else:
             parameters[name] = configuration
     return parameters

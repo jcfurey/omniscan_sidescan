@@ -5,7 +5,6 @@
 #include <lifecycle_msgs/msg/state.hpp>
 #include <rcl_interfaces/msg/floating_point_range.hpp>
 #include <rcl_interfaces/msg/integer_range.hpp>
-#include <rclcpp_components/register_node_macro.hpp>
 
 #include <algorithm>
 #include <cmath>
@@ -171,6 +170,7 @@ SonarNode::~SonarNode()
     }
   }
   stop();
+  release_resources();
 }
 
 void SonarNode::declare_parameters()
@@ -184,7 +184,12 @@ void SonarNode::declare_parameters()
   declare_parameter("length_mm", int64_t{5000},
       integer_descriptor("profile length in mm", 1, 300000));
   declare_parameter("msec_per_ping", int64_t{0},
-      integer_descriptor("minimum ping period; zero is fastest", 0, 10));
+      integer_descriptor("minimum ping period in ms; zero is fastest", 0, UINT32_MAX));
+  Descriptor sync_descriptor;
+  sync_descriptor.description =
+    "assign and verify device sync groups; requires UDP 51201 between heads";
+  sync_descriptor.read_only = true;
+  declare_parameter("sync_enabled", false, sync_descriptor);
   declare_parameter("pulse_len_percent", 0.002,
       float_descriptor("pulse duration fraction", 0.002, 0.004));
   declare_parameter("filter_duration_percent", 0.0015,
@@ -246,7 +251,7 @@ rcl_interfaces::msg::SetParametersResult SonarNode::validate(
 {
   rcl_interfaces::msg::SetParametersResult result;
   try {
-    parameters(values);
+    const auto params = parameters(values);
     const auto proposed = [this, &values](const std::string & name) {
         for (const auto & value : values) {
           if (value.get_name() == name) {
@@ -266,6 +271,13 @@ rcl_interfaces::msg::SetParametersResult SonarNode::validate(
         throw std::invalid_argument(std::string(name) + " must be finite and in [0.001, 60]");
       }
     }
+    const auto period = static_cast<double>(params.msec_per_ping) / 1000.0;
+    if (period >= proposed("read_timeout").as_double() ||
+      period >= proposed("configuration_timeout").as_double())
+    {
+      throw std::invalid_argument(
+              "read_timeout and configuration_timeout must exceed msec_per_ping / 1000");
+    }
     result.successful = true;
   } catch (const std::exception & error) {
     result.reason = error.what();
@@ -281,12 +293,21 @@ void SonarNode::committed()
   const auto age = get_parameter("max_profile_age").as_double();
   const auto skew = get_parameter("max_profile_skew").as_double();
   std::lock_guard lock(mutex_);
-  if (desired_ != params) {++generation_;}
+  const bool changed = desired_ != params;
+  if (changed) {++generation_;}
   desired_ = params;
   frame_id_ = frame;
   read_timeout_ = timeout;
   max_age_ = age;
   max_skew_ = skew;
+  publication_generation_.store(generation_);
+  publication_max_age_.store(age);
+  publication_max_skew_.store(skew);
+  if (changed) {
+    for (auto * output : publications()) {
+      output->discard_pending();
+    }
+  }
   for (auto & channel : channels_) {
     channel->configure(desired_, generation_, read_timeout_);
   }
@@ -303,6 +324,7 @@ SonarNode::CallbackReturn SonarNode::on_configure(const rclcpp_lifecycle::State 
       throw std::invalid_argument("reconnect_initial_delay exceeds reconnect_max_delay");
     }
     const auto prefix = "omniscan" + std::to_string(get_parameter("sensor_number").as_int());
+    const auto sync = get_parameter("sync_enabled").as_bool();
     // Read ROS parameters before acquiring our state mutex. Parameter commit
     // callbacks take the ROS parameter mutex first, so reversing that order
     // would deadlock with a concurrent programmatic parameter update.
@@ -321,6 +343,10 @@ SonarNode::CallbackReturn SonarNode::on_configure(const rclcpp_lifecycle::State 
       options.connection.port = static_cast<uint16_t>(get_parameter(names_[i] + "_port").as_int());
       options.connection.connect_timeout = get_parameter("connect_timeout").as_double();
       options.connection.configuration_timeout = get_parameter("configuration_timeout").as_double();
+      if (sync) {
+        options.connection.sync = ConnectionOptions::Sync{
+          static_cast<uint8_t>(i), static_cast<uint8_t>(channel_count_)};
+      }
       options.max_consecutive_failures =
         static_cast<uint64_t>(get_parameter("max_consecutive_failures").as_int());
       options.reconnect_initial_delay = initial;
@@ -347,6 +373,7 @@ SonarNode::CallbackReturn SonarNode::on_configure(const rclcpp_lifecycle::State 
     for (size_t i = 0; i < channel_count_; ++i) {
       head_publishers_.push_back(create_publisher<omniscan_sidescan_msgs::msg::SonarProfile>(
           prefix + "/" + names_[i] + "/profile", qos));
+      head_publications_.push_back(std::make_unique<Publication>());
       auto log = [logger, name = names_[i]](const std::string & message, bool error) {
           if (error) {
             RCLCPP_WARN(logger, "%s sonar: %s", name.c_str(), message.c_str());
@@ -360,6 +387,11 @@ SonarNode::CallbackReturn SonarNode::on_configure(const rclcpp_lifecycle::State 
     }
     last_profile_.fill(0);
     last_combined_.fill(0);
+    // Reuse publication threads across activations. Deactivation drains tasks;
+    // cleanup joins the idle workers before releasing their ROS publishers.
+    for (auto * output : publications()) {
+      output->start(); output->pause();
+    }
     diagnostics_timer_ = create_wall_timer(std::chrono::seconds(1), [this] {diagnostics();});
     return CallbackReturn::SUCCESS;
   } catch (const std::exception & error) {
@@ -386,6 +418,9 @@ SonarNode::CallbackReturn SonarNode::on_activate(const rclcpp_lifecycle::State &
     {
       std::lock_guard lock(mutex_);
       set_publishers_active(true);
+      for (auto * output : publications()) {
+        output->resume();
+      }
       active_.store(true);
     }
     for (auto & channel : channels_) {
@@ -406,8 +441,14 @@ void SonarNode::stop()
   for (auto & channel : channels_) {
     channel->stop();
   }
+  for (auto * output : publications()) {
+    output->pause();
+  }
   for (auto & channel : channels_) {
     channel->join();
+  }
+  for (auto * output : publications()) {
+    output->wait_idle();
   }
   std::lock_guard lock(mutex_);
   set_publishers_active(false);
@@ -421,10 +462,17 @@ SonarNode::CallbackReturn SonarNode::on_deactivate(const rclcpp_lifecycle::State
 
 void SonarNode::release_resources()
 {
+  for (auto * output : publications()) {
+    output->stop();
+  }
+  for (auto * output : publications()) {
+    output->join();
+  }
   std::lock_guard lock(mutex_);
   diagnostics_timer_.reset();
   channels_.clear();
   head_publishers_.clear();
+  head_publications_.clear();
   raw_two_.reset(); scaled_two_.reset(); raw_all_.reset(); scaled_all_.reset();
   diagnostics_pub_.reset();
 }
@@ -517,28 +565,39 @@ void SonarNode::profiles()
       message.transducer_heading_deg = p.transducer_heading_deg;
       message.pwr_data.assign(p.raw.begin(), p.raw.end());
       message.scaled_data.assign(p.scaled.begin(), p.scaled.end());
-      head_publishers_[i]->publish(message);
+      auto publisher = head_publishers_[i];
+      enqueue(*head_publications_[i], [publisher, message = std::move(message)] {
+          publisher->publish(message);
+        }, p.received);
       last_profile_[i] = sample.sequence;
     }
     if (!combined_problem(views, now).empty()) {return;}
     for (size_t i = 0; i < views.size(); ++i) {
       if (views[i].sample->sequence == last_combined_[i]) {return;}
     }
-    const auto oldest = std::min_element(views.begin(), views.end(),
+    const auto [oldest, newest] = std::minmax_element(views.begin(), views.end(),
         [](const auto & a, const auto & b) {
           return a.sample->profile.received < b.sample->profile.received;
       });
     const auto stamp = oldest->sample->profile.timestamp_ns;
+    const auto skew = std::chrono::duration<double>(newest->sample->profile.received -
+        oldest->sample->profile.received).count();
     if (channel_count_ == 4) {
-      raw_all_->publish(combined_message<omniscan_sidescan_msgs::msg::SideScanSonarAllRaw>(views,
-          frame_id_, stamp));
-      scaled_all_->publish(combined_message<omniscan_sidescan_msgs::msg::SideScanSonarAll>(views,
-          frame_id_, stamp));
+      enqueue(combined_publication_, [raw = raw_all_, scaled = scaled_all_, views,
+        frame = frame_id_, stamp] {
+          raw->publish(combined_message<omniscan_sidescan_msgs::msg::SideScanSonarAllRaw>(views,
+              frame, stamp));
+          scaled->publish(combined_message<omniscan_sidescan_msgs::msg::SideScanSonarAll>(views,
+              frame, stamp));
+        }, oldest->sample->profile.received, skew);
     } else {
-      raw_two_->publish(combined_message<omniscan_sidescan_msgs::msg::SideScanSonarRaw>(views,
-          frame_id_, stamp));
-      scaled_two_->publish(combined_message<omniscan_sidescan_msgs::msg::SideScanSonar>(views,
-          frame_id_, stamp));
+      enqueue(combined_publication_, [raw = raw_two_, scaled = scaled_two_, views,
+        frame = frame_id_, stamp] {
+          raw->publish(combined_message<omniscan_sidescan_msgs::msg::SideScanSonarRaw>(views,
+              frame, stamp));
+          scaled->publish(combined_message<omniscan_sidescan_msgs::msg::SideScanSonar>(views,
+              frame, stamp));
+        }, oldest->sample->profile.received, skew);
     }
     for (size_t i = 0; i < views.size(); ++i) {
       last_combined_[i] = views[i].sample->sequence;
@@ -550,9 +609,38 @@ void SonarNode::profiles()
   }
 }
 
+std::vector<Publication *> SonarNode::publications()
+{
+  std::vector<Publication *> outputs{&combined_publication_, &diagnostics_publication_};
+  for (auto & output : head_publications_) {
+    outputs.push_back(output.get());
+  }
+  return outputs;
+}
+
+void SonarNode::enqueue(
+  Publication & output, Publication::Task task, Deadline received, double skew)
+{
+  output.submit([this, task = std::move(task), generation = generation_, received, skew] {
+      if (!active_.load() || publication_generation_.load() != generation ||
+      !rclcpp::ok(get_node_base_interface()->get_context()) ||
+      (received != Deadline{} &&
+      std::chrono::duration<double>(SteadyClock::now() - received).count() >
+      publication_max_age_.load()) || skew > publication_max_skew_.load()) {return;}
+      try {
+        task();
+      } catch (const std::exception & error) {
+        if (rclcpp::ok(get_node_base_interface()->get_context())) {
+          RCLCPP_ERROR(get_logger(), "publish: %s", error.what());
+        }
+        throw;
+      }
+    });
+}
+
 void SonarNode::diagnostics()
 {
-  if (!active_.load()) {return;}
+  if (!active_.load() || !rclcpp::ok(get_node_base_interface()->get_context())) {return;}
   std::lock_guard lock(mutex_);
   if (!active_.load()) {return;}
   const auto views = snapshots();
@@ -576,6 +664,12 @@ void SonarNode::diagnostics()
     key(status, "profiles_received", s.profiles_received);
     key(status, "duplicate_profiles", s.duplicate_profiles);
     key(status, "parser_errors", s.parser_errors);
+    key(status, "publication_coalesced", head_publications_[i]->coalesced());
+    key(status, "publication_failures", head_publications_[i]->failures());
+    key(status, "timestamp_source",
+        "host receipt; device uptime retained without clock calibration");
+    key(status, "sync_assignment_verified", s.sync_verified);
+    key(status, "acoustic_timing_verified", false);
     key(status, "confirmation",
         "geometry, sound speed and manual gain checked in profiles; ping period, pulse and filter fractions are commanded only");
     parameter_keys(status, "desired.", desired_);
@@ -600,9 +694,8 @@ void SonarNode::diagnostics()
     combined.message = "fresh consistent profiles within host receive skew";
   }
   message.status.push_back(std::move(combined));
-  diagnostics_pub_->publish(message);
+  enqueue(diagnostics_publication_, [publisher = diagnostics_pub_, message = std::move(message)] {
+      publisher->publish(message);
+    }, {});  // Health reports are independent of the sonar profile age limit.
 }
 }  // namespace omniscan_sidescan
-
-RCLCPP_COMPONENTS_REGISTER_NODE(omniscan_sidescan::SonarNode)
-RCLCPP_COMPONENTS_REGISTER_NODE(omniscan_sidescan::SonarAllNode)

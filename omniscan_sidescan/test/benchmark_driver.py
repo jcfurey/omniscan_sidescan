@@ -23,6 +23,7 @@ from omniscan_sidescan.omniscan450_simulator import Omniscan450Simulator
 from omniscan_sidescan_msgs.msg import SideScanSonarAll, SideScanSonarAllRaw, SonarProfile
 import rclpy
 from rclpy.qos import qos_profile_sensor_data
+from rclpy.utilities import get_rmw_implementation_identifier
 
 CHANNELS = ('port', 'starboard', 'bow', 'stern')
 
@@ -133,6 +134,7 @@ def main():
             run['received_hz']['combined'] for run in subset)
     print(json.dumps({
         'platform': platform.platform(), 'ros_distro': os.environ.get('ROS_DISTRO'),
+        'rmw_implementation': get_rmw_implementation_identifier(),
         'channels': 4, 'samples': args.samples, 'requested_rate_hz': args.rate,
         'subscribers': 6, 'runs': runs, 'median': summary,
     }, indent=2))

@@ -24,6 +24,7 @@ struct ChannelSnapshot
   uint64_t desired_generation{};
   int64_t applied_generation{-1};
   std::optional<Params> applied_params;
+  bool sync_verified{};
   uint64_t connection_attempts{}, connections{}, profiles_received{}, duplicate_profiles{},
     parser_errors{};
 };

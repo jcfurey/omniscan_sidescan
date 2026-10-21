@@ -58,7 +58,11 @@ void Channel::status(const std::string & state, const std::string & error, bool 
     snapshot_.state = state;
     snapshot_.error = error;
     snapshot_.sample.reset();
-    if (reset) {snapshot_.applied_generation = -1; snapshot_.applied_params.reset();}
+    if (reset) {
+      snapshot_.applied_generation = -1;
+      snapshot_.applied_params.reset();
+      snapshot_.sync_verified = false;
+    }
   }
   // Never invoke external callbacks under the channel lock. ROS parameter
   // callbacks acquire the node lock before queueing channel settings.
@@ -92,6 +96,7 @@ void Channel::run()
             std::lock_guard lock(mutex_);
             snapshot_.applied_generation = static_cast<int64_t>(desired.generation);
             snapshot_.applied_params = desired.params;
+            snapshot_.sync_verified = connection.sync_verified();
             ++snapshot_.connections;
           }
           status("configuring");

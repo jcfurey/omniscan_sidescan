@@ -1,0 +1,114 @@
+name: ROS 2 driver
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      soak_seconds:
+        description: Simulator soak duration in seconds (up to 3600)
+        type: number
+        default: 60
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    container: ros:lyrical-ros-base-resolute
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        middleware: [rmw_fastrtps_cpp, rmw_cyclonedds_cpp]
+    env:
+      RMW_IMPLEMENTATION: ${{ matrix.middleware }}
+      ROS_AUTOMATIC_DISCOVERY_RANGE: LOCALHOST
+      ROS_DOMAIN_ID: 91
+      ROS_LOG_DIR: /tmp/omniscan-ros-log
+      SOAK_SECONDS: ${{ inputs.soak_seconds || 60 }}
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install dependencies
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends libc-ares-dev ros-lyrical-rmw-cyclonedds-cpp
+          rosdep update --rosdistro lyrical
+          rosdep install --from-paths . --ignore-src -y --rosdistro lyrical --skip-keys libc-ares-dev
+      - name: Build
+        run: |
+          source /opt/ros/lyrical/setup.bash
+          colcon build --merge-install --cmake-args -DCMAKE_BUILD_TYPE=RelWithDebInfo
+      - name: Test
+        run: |
+          source install/setup.bash
+          colcon test --merge-install --return-code-on-test-failure --event-handlers console_cohesion+
+          colcon test-result --verbose
+      - name: Multithreaded component soak
+        run: |
+          source install/setup.bash
+          python3 omniscan_sidescan/test/soak_driver.py --component multi-threaded \
+            --seconds "$SOAK_SECONDS" --report log/soak.json
+      - name: Address and undefined behavior sanitizers
+        if: matrix.middleware == 'rmw_fastrtps_cpp'
+        env:
+          ASAN_OPTIONS: detect_leaks=1:halt_on_error=1
+          UBSAN_OPTIONS: halt_on_error=1
+        run: |
+          source install/setup.bash
+          cd omniscan_sidescan
+          c++ -std=c++20 -g -O1 -fsanitize=address,undefined -fno-omit-frame-pointer \
+            -I include test/test_protocol.cpp test/test_transport.cpp src/protocol.cpp \
+            src/resolver.cpp src/publication.cpp -pthread -lcares -lgtest -lgtest_main -o /tmp/core-asan
+          /tmp/core-asan
+          c++ -std=c++20 -g -O1 -fsanitize=address,undefined -fno-omit-frame-pointer \
+            -I include test/connection_probe.cpp src/connection.cpp src/protocol.cpp \
+            src/resolver.cpp -pthread -lcares -o /tmp/connection-asan
+          OMNISCAN_CONNECTION_PROBE_EXECUTABLE=/tmp/connection-asan \
+            python3 -m pytest test/test_connection.py -q
+      - name: Thread sanitizer
+        if: matrix.middleware == 'rmw_fastrtps_cpp'
+        env:
+          TSAN_OPTIONS: halt_on_error=1
+        run: |
+          source install/setup.bash
+          cd omniscan_sidescan
+          c++ -std=c++20 -g -O1 -fsanitize=thread -fno-omit-frame-pointer \
+            -I include test/test_transport.cpp src/resolver.cpp src/publication.cpp \
+            -pthread -lcares -lgtest -lgtest_main -o /tmp/transport-tsan
+          /tmp/transport-tsan
+          c++ -std=c++20 -g -O1 -fsanitize=thread -fno-omit-frame-pointer \
+            -I include test/channel_stress.cpp src/channel.cpp src/connection.cpp \
+            src/protocol.cpp src/resolver.cpp -pthread -lcares -o /tmp/channel-tsan
+          OMNISCAN_CHANNEL_STRESS_EXECUTABLE=/tmp/channel-tsan \
+            python3 -m pytest test/test_channel_stress.py -q
+      - name: ROS runtime and component sanitizers
+        if: matrix.middleware == 'rmw_fastrtps_cpp'
+        env:
+          ASAN_OPTIONS: detect_leaks=1:halt_on_error=1:quarantine_size_mb=4:thread_local_quarantine_size_kb=64
+          UBSAN_OPTIONS: halt_on_error=1
+        run: |
+          source install/setup.bash
+          cmake -S omniscan_sidescan -B build-asan \
+            -DCMAKE_INSTALL_PREFIX="$PWD/install-asan" -DBUILD_TESTING=OFF \
+            -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+            -DCMAKE_CXX_FLAGS='-fsanitize=address,undefined -fno-omit-frame-pointer'
+          cmake --build build-asan --parallel 2
+          cmake --install build-asan
+          source install-asan/share/omniscan_sidescan/local_setup.bash
+          OMNISCAN_COMPONENT_PRELOAD="$(c++ -print-file-name=libasan.so)" \
+            OMNISCAN_PUBLICATION_STALL_LIBRARY="$PWD/build/omniscan_sidescan/libpublication_stall.so" \
+            python3 -m pytest omniscan_sidescan/test/test_cpp_driver.py -q
+      - name: Save results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: results-${{ matrix.middleware }}
+          path: |
+            log/
+            build/*/test_results/
+            /tmp/omniscan-ros-log/

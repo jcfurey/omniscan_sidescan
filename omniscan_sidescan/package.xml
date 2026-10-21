@@ -19,7 +19,10 @@
   <depend>rclcpp</depend>
   <depend>rclcpp_lifecycle</depend>
   <depend>rclcpp_components</depend>
+  <depend>class_loader</depend>
   <depend>lifecycle_msgs</depend>
+  <!-- Local rosdep rule is in ../rosdep.yaml until an upstream rule exists. -->
+  <depend>libc-ares-dev</depend>
 
   <exec_depend>ament_index_python</exec_depend>
   <exec_depend>launch</exec_depend>

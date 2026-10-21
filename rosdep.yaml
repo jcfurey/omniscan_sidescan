@@ -1,0 +1,5 @@
+# c-ares has no upstream rosdep key at present. Install this system package
+# before rosdep, then pass --skip-keys libc-ares-dev, or register this rule.
+libc-ares-dev:
+  debian: [libc-ares-dev]
+  ubuntu: [libc-ares-dev]

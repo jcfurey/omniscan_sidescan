@@ -80,6 +80,7 @@ class SideScanSonarNode(Node):
         self._desired_params = self._current_sonar_params()
         self._generation = 0
         self._read_timeout = self.get_parameter('read_timeout').value
+        self._validate_period(self._desired_params, self._read_timeout)
         self._max_profile_age = self.get_parameter('max_profile_age').value
         self._max_profile_skew = self.get_parameter('max_profile_skew').value
         self._last_profile_sequences = dict.fromkeys(self.CHANNELS, -1)
@@ -196,7 +197,10 @@ class SideScanSonarNode(Node):
         overrides = {p.name: p.value for p in parameters
                      if p.name in SonarParams.field_names()}
         try:
-            self._current_sonar_params(overrides)
+            params = self._current_sonar_params(overrides)
+            timeout = next((p.value for p in parameters if p.name == 'read_timeout'),
+                           self.get_parameter('read_timeout').value)
+            self._validate_period(params, timeout)
             for parameter in parameters:
                 if parameter.name == 'frame_id' and not parameter.value.strip():
                     raise ValueError('frame_id must not be empty')
@@ -206,6 +210,12 @@ class SideScanSonarNode(Node):
         except (TypeError, ValueError) as exception:
             return SetParametersResult(successful=False, reason=str(exception))
         return SetParametersResult(successful=True)
+
+    def _validate_period(self, params, timeout):
+        period = params.msec_per_ping / 1000.0
+        if period >= timeout or period >= self.get_parameter('configuration_timeout').value:
+            raise ValueError(
+                'read_timeout and configuration_timeout must exceed msec_per_ping / 1000')
 
     def _post_set_parameters(self, parameters):
         """Queue only committed desired settings; device status is asynchronous."""
