@@ -7,22 +7,27 @@ Sonar](https://bluerobotics.com/store/the-reef/cerulean-sidescan-sonar/).
 > lives on the `main` branch. The two are kept on separate branches; neither
 > contains the other.
 
-Standalone: the only dependencies are a ROS 2 install (`rclpy`, `std_msgs`,
-`diagnostic_msgs`)
-and the Python standard library. The parts of
-[ping-python](https://github.com/bluerobotics/ping-python) the sonar needs are
-vendored under `omniscan_sidescan/brping/`, so there is nothing to `pip
-install` and no source checkout to keep in sync.
+The runtime driver is C++20, using `rclcpp`, lifecycle nodes, and composable
+components. Each sonar has its own TCP worker, parser, configuration state, and
+reconnect backoff. Network waits run outside the ROS executor. The native
+protocol/transport code uses the C++ standard library and Linux/POSIX sockets;
+it has no Python or vendor SDK dependency.
 
-Built and tested on ROS 2 Lyrical. The implementation uses APIs available in
-ROS 2 Jazzy and newer.
+Python remains available for the TCP simulator, integration tests, launch
+files, and the previous driver as a comparison baseline. The simulator and
+reference driver use a vendored subset of
+[ping-python](https://github.com/bluerobotics/ping-python); no `pip` installation
+or separate source checkout is required.
+
+Built and tested on ROS 2 Lyrical with GCC 15.2. A C++20 compiler is required;
+other ROS distributions have not been validated for this conversion.
 
 ## Packages
 
 | Package | Build type | Contents |
 | --- | --- | --- |
-| `omniscan_sidescan_msgs` | `ament_cmake_auto` | the four message definitions |
-| `omniscan_sidescan` | `ament_cmake_auto` | Python driver, nodes, launch files, simulator |
+| `omniscan_sidescan_msgs` | `ament_cmake_auto` | four legacy message definitions and per-head `SonarProfile` |
+| `omniscan_sidescan` | `ament_cmake_auto` | C++ driver/components, launch files, Python simulator/reference driver |
 
 They are split so the messages can be depended on without pulling in the
 driver, which is the usual ROS 2 arrangement.
@@ -36,7 +41,7 @@ repository root, so colcon finds them directly:
 mkdir -p ~/ros2_ws/src && cd ~/ros2_ws/src
 git clone -b <this branch> <this repository>
 cd ~/ros2_ws
-colcon build --packages-up-to omniscan_sidescan
+colcon build --packages-up-to omniscan_sidescan --cmake-args -DCMAKE_BUILD_TYPE=RelWithDebInfo
 source install/setup.bash
 ```
 
@@ -70,6 +75,42 @@ A parameter file is also provided, see `config/omniscan450.yaml`:
 ros2 run omniscan_sidescan sidescansonarall_node \
     --ros-args --params-file <path>/config/omniscan450.yaml
 ```
+
+The existing executable and launch names now start C++. Standalone executables
+configure and activate automatically, including when a device is unavailable.
+For comparison, the previous Python executables are installed as
+`sidescansonar_node_python` and `sidescansonarall_node_python`; they accept the
+same ROS parameters and publish the same messages.
+
+### Lifecycle and composition
+
+Both native nodes provide the standard lifecycle services. `deactivate` cancels
+network waits, stops streaming, and joins all workers; `activate` reconnects
+using the latest committed settings. `cleanup` releases publishers and channel
+resources. Shutdown and component destruction also join workers before their
+ROS resources are destroyed.
+
+The registered components are `omniscan_sidescan::SonarNode` (two heads) and
+`omniscan_sidescan::SonarAllNode` (four heads). Components start **unconfigured**,
+so a lifecycle manager controls when hardware connections begin. For example,
+start a container in one terminal:
+
+```
+ros2 run rclcpp_components component_container --ros-args -r __node:=sonar_container
+```
+
+Then load and activate the four-head component:
+
+```
+ros2 component load /sonar_container omniscan_sidescan omniscan_sidescan::SonarAllNode \
+    --node-name omniscan450all
+ros2 lifecycle set /omniscan450all configure
+ros2 lifecycle set /omniscan450all activate
+```
+
+Supply addresses and other read-only parameters when loading the component.
+Namespaces, remappings, and `use_intra_process_comms` through component extra
+arguments are supported.
 
 ### Recording
 
@@ -213,11 +254,46 @@ colcon test --packages-select omniscan_sidescan_msgs omniscan_sidescan
 colcon test-result --all
 ```
 
-The suite covers an independent command-byte fixture, framing recovery, rejected
-and ignored settings, profile validation, ROS parameter vetoes, independent
-outage recovery, counter wrap/duplicates, receive timestamps, stale/skewed sets,
-and cancellation of long waits. Both two- and four-channel publication are
-tested against TCP simulators without hardware.
+Native GTests cover independent command/profile fixtures, framing recovery,
+bounded buffering, power scaling, parameter validation, and lifecycle setup.
+Python integration tests run the installed C++ executables through TCP and DDS,
+checking both legacy message variants, all per-head topics, oldest receipt
+stamps, rejected/ignored settings, independent outages, malformed profiles,
+configuration drift, counter wrap/reboots/duplicates, lifecycle reactivation,
+component load/unload with intra-process enabled, and cancellation of long
+waits. The Python reference driver's regression suite is also retained.
+
+These tests use simulated devices; on-hardware firmware and timing validation
+is still required.
+
+### Comparing runtime cost
+
+After building and sourcing the workspace, run from `omniscan_sidescan/`:
+
+```
+python3 test/benchmark_driver.py --seconds 10 --runs 3
+```
+
+This alternates the installed C++ and Python drivers against four separate
+TCP simulators, with 1200 samples per head at a requested 20 Hz and six DDS
+subscriptions (four profiles and both legacy topics). JSON output includes
+per-run CPU time, resident memory, and observed publication rates. Linux
+`/proc` accounting measures only the driver process and its threads; simulator
+and observer CPU are excluded. This measures host processing cost, not the
+physical sonar's achievable ping rate or acoustic synchronization.
+
+On a Threadripper 3970X running ROS 2 Lyrical, GCC 15.2, and a
+`RelWithDebInfo` build, three 10-second runs of that workload measured these
+medians:
+
+| Driver | CPU (% of one core) | Resident memory | Combined sets/s |
+| --- | --- | --- | --- |
+| C++ | 1.30% | 20.3 MiB | 19.50 |
+| Python reference | 10.50% | 65.3 MiB | 19.50 |
+
+The simulator's requested rate is 20 Hz; its scheduling and packet-generation
+overhead account for the observed rate being slightly lower. These are local
+host measurements, not a guarantee for other hardware or networks.
 
 ## Differences from the ROS 1 package
 
