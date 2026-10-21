@@ -1,6 +1,7 @@
 """Exercise the installed C++ executables over TCP and actual ROS services."""
 
 from collections import deque
+import os
 from pathlib import Path
 import signal
 import socket
@@ -31,6 +32,30 @@ from rclpy.parameter_client import AsyncParameterClient
 from rclpy.qos import qos_profile_sensor_data
 
 
+class FragmentingConnection:
+    """Split real TCP writes across header, metadata, and sample boundaries."""
+
+    def __init__(self, connection, owner):
+        self.connection, self.owner = connection, owner
+
+    def __getattr__(self, name):
+        return getattr(self.connection, name)
+
+    def sendall(self, data):
+        """Forward either a normal packet or deliberately fragmented bytes."""
+        if not self.owner.fragment_responses:
+            self.connection.sendall(data)
+            return
+        cursor = 0
+        for size in (1, 2, 5, 13, 37, 211, 1021, len(data)):
+            chunk = data[cursor:cursor + size]
+            if not chunk:
+                break
+            self.connection.sendall(chunk)
+            cursor += len(chunk)
+            time.sleep(0.0002)
+
+
 class ControlledSimulator(Omniscan450Simulator):
     """Inject faults independently of the native protocol implementation."""
 
@@ -42,12 +67,17 @@ class ControlledSimulator(Omniscan450Simulator):
     ignore_information = False
     connections = 0
     profile_gate = None
+    last_requested_length = None
+    fragment_responses = False
+    noise_only = False
 
     def _handle_connection(self, connection):
         self.connections += 1
-        super()._handle_connection(connection)
+        super()._handle_connection(FragmentingConnection(connection, self))
 
     def _handle_message(self, connection, message):
+        if message.message_id == 2197 and message.enable:
+            self.last_requested_length = message.length_mm
         if message.message_id == 2197 and message.enable \
                 and message.length_mm == self.rejected_length:
             if self.rejection_mode == 'nack':
@@ -63,6 +93,9 @@ class ControlledSimulator(Omniscan450Simulator):
             super()._handle_request(connection, requested_id)
 
     def _build_profile(self):
+        if self.noise_only:
+            self.ping_number = (self.ping_number + 1) & 0xffffffff
+            return b'BR\xff\xff\x96\x08\x00\x00' + bytes(16384)
         if self.profile_gate is not None:
             while self._running.is_set():
                 if self.profile_gate.acquire(timeout=0.01):
@@ -134,7 +167,11 @@ class NativeHarness:
         self.process = subprocess.Popen(command, stdout=self.log, stderr=subprocess.STDOUT)
         self.client = AsyncParameterClient(self.node, self.namespace + '/native')
         if component:
-            self.load_component(count)
+            try:
+                self.load_component(count)
+            except BaseException:
+                self.close()
+                raise
 
     def load_component(self, count):
         """Load through the real component manager with intra-process enabled."""
@@ -202,6 +239,13 @@ class NativeHarness:
         if self.diagnostics:
             return next(s for s in self.diagnostics[-1].status if s.name.endswith('/' + name))
         return None
+
+    def resources(self):
+        """Inspect live descriptors, threads, and resident memory on Linux."""
+        root = Path('/proc') / str(self.process.pid)
+        pages = int((root / 'statm').read_text().split()[1])
+        return (len(list((root / 'fd').iterdir())), len(list((root / 'task').iterdir())),
+                pages * os.sysconf('SC_PAGE_SIZE') / (1024 * 1024))
 
     def close(self):
         """Stop native workers before destroying DDS and simulated devices."""
@@ -363,6 +407,119 @@ def test_cpp_lifecycle_releases_connections_and_reactivates(native_factory):
     h.transition(Transition.TRANSITION_ACTIVATE)
     h.wait(lambda: all(device.connections == 3 for device in h.devices.values()))
     h.wait(lambda: h.combined[-1].length_mm == 7000)
+
+
+def test_cpp_new_settings_interrupt_a_silent_long_read(native_factory):
+    h = native_factory(read_timeout=60.0)
+    h.wait(lambda: h.combined)
+    h.devices['starboard'].enabled = False
+    h.pump(0.15)
+    assert h.update(length_mm=7000).successful
+    h.wait(lambda: all(messages[-1].length_mm == 7000
+                       and messages[-1].configuration_generation == 1
+                       for messages in h.profiles.values()), timeout=0.8)
+    assert all(device.connections == 1 for device in h.devices.values())
+
+
+def test_cpp_read_timeout_update_interrupts_the_previous_deadline(native_factory):
+    h = native_factory(read_timeout=60.0)
+    h.wait(lambda: h.combined)
+    faulty = h.devices['starboard']
+    faulty.enabled = False
+    h.pump(0.15)
+    assert h.update(read_timeout=0.05).successful
+    h.wait(lambda: faulty.connections == 2, timeout=0.8)
+    h.wait(lambda: h.combined[-1].starboard_ping_number > 0)
+    assert h.devices['port'].connections == 1
+    assert h.profiles['port'][-1].configuration_generation == 0
+
+
+def test_cpp_new_settings_supersede_unconfirmed_configuration(native_factory):
+    h = native_factory(configuration_timeout=60.0)
+    h.wait(lambda: h.combined)
+    faulty = h.devices['starboard']
+    faulty.rejection_mode, faulty.rejected_length = 'ignore', 7000
+    assert h.update(length_mm=7000).successful
+    h.wait(lambda: faulty.last_requested_length == 7000
+           and h.profiles['port'][-1].configuration_generation == 1)
+    assert h.update(length_mm=5000).successful
+    h.wait(lambda: all(messages[-1].configuration_generation == 2
+                       and messages[-1].length_mm == 5000
+                       for messages in h.profiles.values()), timeout=1.0)
+    assert h.devices['port'].connections == 1
+    assert faulty.connections == 2
+
+
+def test_cpp_new_settings_wake_long_failure_backoff(native_factory):
+    h = native_factory(reconnect_initial_delay=60.0, reconnect_max_delay=60.0)
+    h.wait(lambda: h.combined)
+    faulty = h.devices['starboard']
+    faulty.rejected_length = 7000
+    assert h.update(length_mm=7000).successful
+    h.wait(lambda: h.status('starboard') is not None
+           and h.status('starboard').level == DiagnosticStatus.ERROR)
+    assert h.update(length_mm=5000).successful
+    h.wait(lambda: all(messages[-1].configuration_generation == 2
+                       for messages in h.profiles.values()), timeout=1.0)
+    assert h.devices['port'].connections == 1
+    assert faulty.connections == 2
+
+
+def test_cpp_fragmented_streams_survive_bursts_of_settings_updates(native_factory):
+    h = native_factory(count=4, configuration_timeout=1.0)
+    h.wait(lambda: h.combined)
+    for device in h.devices.values():
+        device.fragment_responses = True
+    for index in range(1, 21):
+        assert h.update(length_mm=5000 + index * 100).successful
+    h.wait(lambda: all(messages[-1].configuration_generation == 20
+                       and messages[-1].length_mm == 7000
+                       for messages in h.profiles.values()), timeout=3.0)
+    h.wait(lambda: h.combined[-1].length_mm == 7000)
+    for messages in h.profiles.values():
+        generations = [message.configuration_generation for message in messages]
+        assert generations == sorted(generations)
+        assert len(messages[-1].pwr_data) == 1200
+
+
+def test_cpp_continuous_malformed_traffic_stays_bounded_and_isolated(native_factory):
+    h = native_factory(max_consecutive_failures=0)
+    h.wait(lambda: h.combined)
+    before = h.resources()
+    faulty = h.devices['starboard']
+    faulty.noise_only = True
+    h.wait(lambda: h.status('starboard') is not None
+           and h.status('starboard').level == DiagnosticStatus.ERROR)
+    values = {item.key: item.value for item in h.status('starboard').values}
+    assert int(values['parser_errors']) > 0
+    assert h.status('port').level == DiagnosticStatus.OK
+    assert h.resources()[2] < before[2] + 8
+    assert all(device.connections == 1 for device in h.devices.values())
+    faulty.noise_only = False
+    previous = len(h.combined)
+    h.wait(lambda: len(h.combined) > previous)
+
+
+def test_cpp_lifecycle_churn_releases_threads_and_descriptors(native_factory):
+    h = native_factory(count=4)
+    h.wait(lambda: h.combined)
+    baseline = h.resources()
+    for index in range(12):
+        h.transition(Transition.TRANSITION_DEACTIVATE)
+        h.transition(Transition.TRANSITION_CLEANUP)
+        inactive = h.resources()
+        assert inactive[0] <= baseline[0] - 4
+        assert inactive[1] <= baseline[1] - 4
+        assert h.update(length_mm=6000 + index * 100).successful
+        h.transition(Transition.TRANSITION_CONFIGURE)
+        h.transition(Transition.TRANSITION_ACTIVATE)
+        previous = len(h.combined)
+        h.wait(lambda: len(h.combined) > previous
+               and h.combined[-1].length_mm == 6000 + index * 100)
+        resources = h.resources()
+        assert resources[0] <= baseline[0] + 1
+        assert resources[1] <= baseline[1] + 1
+        assert resources[2] < baseline[2] + 12
 
 
 def test_cpp_duplicate_counter_reconnects_only_affected_head(native_factory):

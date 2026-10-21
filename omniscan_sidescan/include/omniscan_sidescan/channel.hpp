@@ -50,15 +50,15 @@ public:
   void start();
   void stop();
   void join();
-  void configure(Params params, uint64_t generation, double read_timeout);
+  void configure(const Params & params, uint64_t generation, double read_timeout);
   ChannelSnapshot snapshot() const;
 
 private:
-  struct Settings {Params params; uint64_t generation; double read_timeout;};
+  struct Settings {Params params; uint64_t generation; double read_timeout; uint64_t revision{};};
   Settings settings() const;
   void status(const std::string & state, const std::string & error = "", bool reset = false);
   void run();
-  void acquire(Connection & connection, uint64_t generation);
+  void acquire(Connection & connection, uint64_t generation, uint64_t & attempted_revision);
 
   ChannelOptions options_;
   Settings settings_;
@@ -68,6 +68,7 @@ private:
   mutable std::mutex mutex_;
   std::condition_variable wake_;
   std::atomic_bool cancelled_{false};
+  std::atomic<uint64_t> requested_revision_{0};
   ChannelSnapshot snapshot_;
   uint64_t sequence_{}, session_parser_errors_{};
   std::thread thread_;

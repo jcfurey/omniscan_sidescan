@@ -43,8 +43,12 @@ if(BUILD_TESTING)
   target_link_libraries(test_protocol omniscan_protocol)
   ament_add_gtest(test_lifecycle test/test_lifecycle.cpp)
   target_link_libraries(test_lifecycle omniscan_components)
+  add_executable(channel_stress test/channel_stress.cpp)
+  target_link_libraries(channel_stress PRIVATE omniscan_protocol)
+  target_compile_options(channel_stress PRIVATE -Wall -Wextra -Wpedantic)
   ament_uncrustify()
-  ament_add_pytest_test(${PROJECT_NAME}_pytest test TIMEOUT 120)
+  ament_add_pytest_test(${PROJECT_NAME}_pytest test TIMEOUT 120
+    ENV "OMNISCAN_CHANNEL_STRESS_EXECUTABLE=$<TARGET_FILE:channel_stress>")
 endif()
 
 ament_auto_package(INSTALL_TO_SHARE config launch)

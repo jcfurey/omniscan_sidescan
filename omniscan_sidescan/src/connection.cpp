@@ -52,10 +52,18 @@ void Connection::check_cancelled() const
   if (cancelled_.load()) {throw ConnectionError("connection cancelled");}
 }
 
-bool Connection::wait(short events, Deadline deadline, bool ignore_cancel)
+void Connection::check_interrupted(const Interrupt & interrupted) const
+{
+  check_cancelled();
+  if (interrupted && interrupted()) {throw SettingsSuperseded("settings superseded");}
+}
+
+bool Connection::wait(
+  short events, Deadline deadline, bool ignore_cancel,
+  const Interrupt & interrupted)
 {
   while (true) {
-    if (!ignore_cancel) {check_cancelled();}
+    if (!ignore_cancel) {check_interrupted(interrupted);}
     const auto remaining = std::chrono::duration<double, std::milli>(
       deadline - SteadyClock::now()).count();
     if (remaining <= 0) {return false;}
@@ -129,10 +137,12 @@ void Connection::write(std::span<const uint8_t> bytes, Deadline deadline, bool i
   }
 }
 
-std::optional<Packet> Connection::read(Deadline deadline, bool block)
+std::optional<Packet> Connection::read(
+  Deadline deadline, bool block,
+  const Interrupt & interrupted)
 {
   while (true) {
-    check_cancelled();
+    check_interrupted(interrupted);
     if (!pending_.empty()) {
       Packet packet = std::move(pending_.front());
       pending_.pop_front();
@@ -159,7 +169,7 @@ std::optional<Packet> Connection::read(Deadline deadline, bool block)
     if (count == 0) {throw ConnectionError("TCP peer closed the connection");}
     if (errno == EINTR) {continue;}
     if (errno != EAGAIN && errno != EWOULDBLOCK) {throw ConnectionError(system_error("recv"));}
-    if (!block || !wait(POLLIN, deadline)) {return {};}
+    if (!block || !wait(POLLIN, deadline, false, interrupted)) {return {};}
   }
 }
 
@@ -172,10 +182,11 @@ void Connection::check_nack(const Packet & packet) const
   }
 }
 
-void Connection::information(Deadline deadline)
+void Connection::information(Deadline deadline, const Interrupt & interrupted)
 {
+  check_interrupted(interrupted);
   write(protocol::request(protocol::device_information), deadline);
-  while (auto packet = read(deadline)) {
+  while (auto packet = read(deadline, true, interrupted)) {
     check_nack(*packet);
     if (packet->id == protocol::device_information) {return;}
     if (SteadyClock::now() >= deadline) {break;}
@@ -183,18 +194,19 @@ void Connection::information(Deadline deadline)
   throw ConfigurationError("device information request timed out");
 }
 
-void Connection::initialize(const Params & params)
+void Connection::initialize(const Params & params, const Interrupt & interrupted)
 {
   if (socket_ >= 0) {throw std::logic_error("connection is already initialized");}
   params.validate();
   connect();
-  information(after(options_.configuration_timeout));
-  configure(params);
+  information(after(options_.configuration_timeout), interrupted);
+  configure(params, interrupted);
 }
 
-void Connection::configure(const Params & params)
+void Connection::configure(const Params & params, const Interrupt & interrupted)
 {
   params.validate();
+  check_interrupted(interrupted);
   if (configured_ && params == params_) {return;}
   const auto deadline = after(options_.configuration_timeout);
   if (!configured_ || params.speed_of_sound_mm != params_.speed_of_sound_mm) {
@@ -205,8 +217,8 @@ void Connection::configure(const Params & params)
   if (!configured_ || without_speed != params_) {write(protocol::ping_command(params), deadline);}
   // An ordered request forms a stream barrier: profiles buffered before the
   // command cannot confirm it. Commands need not ACK in the vendor protocol.
-  information(deadline);
-  while (auto packet = read(deadline)) {
+  information(deadline, interrupted);
+  while (auto packet = read(deadline, true, interrupted)) {
     check_nack(*packet);
     if (packet->id == protocol::mono_profile) {
       try {
@@ -226,14 +238,14 @@ void Connection::configure(const Params & params)
   throw ConfigurationError("profiles did not confirm the requested configuration");
 }
 
-Profile Connection::read_profile(double timeout)
+Profile Connection::read_profile(double timeout, const Interrupt & interrupted)
 {
   if (!std::isfinite(timeout) || timeout <= 0) {
     throw std::invalid_argument("invalid profile timeout");
   }
   const auto deadline = after(timeout);
   std::optional<Packet> newest;
-  while (auto packet = read(deadline, !newest.has_value())) {
+  while (auto packet = read(deadline, !newest.has_value(), interrupted)) {
     check_nack(*packet);
     if (packet->id == protocol::mono_profile) {newest = std::move(packet);}
     if (SteadyClock::now() >= deadline) {break;}

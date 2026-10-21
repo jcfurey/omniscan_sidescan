@@ -12,6 +12,10 @@
 
 namespace omniscan_sidescan
 {
+// A control-plane update is not a device failure. Reads may be resumed on the
+// same stream; an interrupted configuration leaves uncertain hardware state.
+struct SettingsSuperseded : SonarError {using SonarError::SonarError;};
+
 struct ConnectionOptions
 {
   std::string address;
@@ -26,24 +30,30 @@ class Connection
 {
 public:
   using ClockNs = std::function<int64_t()>;
+  using Interrupt = std::function<bool()>;
   Connection(ConnectionOptions options, const std::atomic_bool & cancelled, ClockNs clock_ns);
   ~Connection();
   Connection(const Connection &) = delete;
   Connection & operator=(const Connection &) = delete;
 
-  void initialize(const Params & params);
-  void configure(const Params & params);
-  Profile read_profile(double timeout);
+  void initialize(const Params & params, const Interrupt & interrupted = {});
+  void configure(const Params & params, const Interrupt & interrupted = {});
+  Profile read_profile(double timeout, const Interrupt & interrupted = {});
   void close() noexcept;
   uint64_t parser_errors() const {return parser_.errors();}
 
 private:
   void connect();
   void check_cancelled() const;
-  bool wait(short events, Deadline deadline, bool ignore_cancel = false);
+  void check_interrupted(const Interrupt & interrupted) const;
+  bool wait(
+    short events, Deadline deadline, bool ignore_cancel = false,
+    const Interrupt & interrupted = {});
   void write(std::span<const uint8_t> bytes, Deadline deadline, bool ignore_cancel = false);
-  std::optional<Packet> read(Deadline deadline, bool block = true);
-  void information(Deadline deadline);
+  std::optional<Packet> read(
+    Deadline deadline, bool block = true,
+    const Interrupt & interrupted = {});
+  void information(Deadline deadline, const Interrupt & interrupted = {});
   void check_nack(const Packet & packet) const;
 
   ConnectionOptions options_;

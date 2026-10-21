@@ -27,17 +27,23 @@ void Channel::start()
 void Channel::stop() {cancelled_.store(true); wake_.notify_all();}
 void Channel::join() {if (thread_.joinable()) {thread_.join();}}
 
-void Channel::configure(Params params, uint64_t generation, double read_timeout)
+void Channel::configure(const Params & params, uint64_t generation, double read_timeout)
 {
-  std::lock_guard lock(mutex_);
-  settings_ = {params, generation, read_timeout};
-  if (generation != snapshot_.desired_generation) {
-    snapshot_.sample.reset();
-    if (snapshot_.state == "streaming" || snapshot_.state == "waiting") {
-      snapshot_.state = "configuring";
+  {
+    std::lock_guard lock(mutex_);
+    if (params == settings_.params && generation == settings_.generation &&
+      read_timeout == settings_.read_timeout) {return;}
+    settings_ = {params, generation, read_timeout, settings_.revision + 1};
+    requested_revision_.store(settings_.revision);
+    if (generation != snapshot_.desired_generation) {
+      snapshot_.sample.reset();
+      if (snapshot_.state == "streaming" || snapshot_.state == "waiting") {
+        snapshot_.state = "configuring";
+      }
     }
+    snapshot_.desired_generation = generation;
   }
-  snapshot_.desired_generation = generation;
+  wake_.notify_all();
 }
 
 ChannelSnapshot Channel::snapshot() const {std::lock_guard lock(mutex_); return snapshot_;}
@@ -66,6 +72,9 @@ void Channel::run()
   try {
     while (!cancelled_.load()) {
       const auto sequence_before = sequence_;
+      const auto desired = settings();
+      auto attempted_revision = desired.revision;
+      bool superseded = false;
       {
         Connection connection(options_.connection, cancelled_, clock_);
         try {
@@ -75,8 +84,10 @@ void Channel::run()
             session_parser_errors_ = snapshot_.parser_errors;
           }
           status("connecting", "", true);
-          auto desired = settings();
-          connection.initialize(desired.params);
+          const auto interrupted = [this, revision = desired.revision] {
+              return requested_revision_.load() != revision;
+            };
+          connection.initialize(desired.params, interrupted);
           {
             std::lock_guard lock(mutex_);
             snapshot_.applied_generation = static_cast<int64_t>(desired.generation);
@@ -84,7 +95,13 @@ void Channel::run()
             ++snapshot_.connections;
           }
           status("configuring");
-          acquire(connection, desired.generation);
+          acquire(connection, desired.generation, attempted_revision);
+        } catch (const SettingsSuperseded &) {
+          // Commands may already have reached the sonar. Re-establish a known
+          // configuration on a fresh stream, without waiting out a failure
+          // backoff for an obsolete desired state.
+          superseded = true;
+          status("configuring", "", true);
         } catch (const SonarError & error) {
           if (!cancelled_.load()) {status("retrying", error.what(), true);}
         }
@@ -93,12 +110,21 @@ void Channel::run()
           snapshot_.parser_errors = session_parser_errors_ + connection.parser_errors();
         }
       }  // Stop streaming and close this head before its independent backoff.
+      if (cancelled_.load()) {break;}
+      if (superseded || requested_revision_.load() != attempted_revision) {
+        delay = options_.reconnect_initial_delay;
+        continue;
+      }
       const bool streamed = sequence_ > sequence_before;
       if (streamed) {delay = options_.reconnect_initial_delay;}
       std::unique_lock lock(mutex_);
-      const auto stopped = [this] {return cancelled_.load();};
-      if (wake_.wait_for(lock, std::chrono::duration<double>(delay), stopped)) {
-        break;
+      const auto changed = [this, attempted_revision] {
+          return cancelled_.load() || requested_revision_.load() != attempted_revision;
+        };
+      if (wake_.wait_for(lock, std::chrono::duration<double>(delay), changed)) {
+        if (cancelled_.load()) {break;}
+        delay = options_.reconnect_initial_delay;
+        continue;
       }
       if (!streamed) {delay = std::min(delay * 2, options_.reconnect_max_delay);}
     }
@@ -108,15 +134,19 @@ void Channel::run()
   }
 }
 
-void Channel::acquire(Connection & connection, uint64_t generation)
+void Channel::acquire(Connection & connection, uint64_t generation, uint64_t & attempted_revision)
 {
   uint64_t failures = 0;
   std::optional<uint32_t> last_ping, last_timestamp;
   while (!cancelled_.load()) {
     auto desired = settings();
+    attempted_revision = desired.revision;
+    const auto interrupted = [this, revision = desired.revision] {
+        return requested_revision_.load() != revision;
+      };
     if (generation != desired.generation) {
       status("configuring");
-      connection.configure(desired.params);
+      connection.configure(desired.params, interrupted);
       generation = desired.generation;
       {
         std::lock_guard lock(mutex_);
@@ -125,7 +155,7 @@ void Channel::acquire(Connection & connection, uint64_t generation)
       }
     }
     try {
-      auto profile = connection.read_profile(desired.read_timeout);
+      auto profile = connection.read_profile(desired.read_timeout, interrupted);
       {
         std::lock_guard lock(mutex_);
         ++snapshot_.profiles_received;
@@ -157,6 +187,10 @@ void Channel::acquire(Connection & connection, uint64_t generation)
       }
       if (changed && log_) {log_("streaming", false);}
       if (notify_) {notify_();}
+    } catch (const SettingsSuperseded &) {
+      // This path has only consumed stream bytes; no command was interrupted.
+      // Re-read committed settings and keep this head's TCP connection intact.
+      continue;
     } catch (const TimeoutError & error) {
       {
         std::lock_guard lock(mutex_);

@@ -247,6 +247,15 @@ arguments and YAML parameters. Shutdown cancels connection/configuration/read
 waits. Hostname resolution follows the operating system's resolver policy;
 use device IP addresses when predictable cancellation is required.
 
+The native driver checks for superseded settings during profile and
+configuration waits. Changing `read_timeout` also interrupts the previous read
+deadline. A read interrupted by an update keeps its TCP connection; superseding
+commands already awaiting confirmation reconnects that head to establish known
+settings. New desired settings wake retry backoff immediately. These updates
+do not count as profile failures, and metadata-only changes do not interrupt
+acquisition. Read waits check for updates at most every 50 ms; packet writes
+finish before the new settings are applied.
+
 ## Testing
 
 ```
@@ -263,8 +272,38 @@ configuration drift, counter wrap/reboots/duplicates, lifecycle reactivation,
 component load/unload with intra-process enabled, and cancellation of long
 waits. The Python reference driver's regression suite is also retained.
 
+Additional native tests cover superseding 60-second reads/configuration waits,
+long retry backoff, fragmented TCP traffic, continuous malformed input, rapid
+parameter updates, and repeated lifecycle cleanup. Lifecycle tests check that
+threads and descriptors are released. A ROS-independent channel stress helper
+runs four concurrent snapshot readers while applying 60 configuration updates
+and starting and stopping all four workers three times. It can also be built
+with thread, address, and undefined-behavior sanitizers.
+
 These tests use simulated devices; on-hardware firmware and timing validation
 is still required.
+
+### Native stress with sanitizers
+
+After sourcing the workspace, run from `omniscan_sidescan/`:
+
+```
+g++ -std=c++20 -O1 -g -fsanitize=thread -fno-omit-frame-pointer \
+    -I include test/channel_stress.cpp src/channel.cpp src/connection.cpp src/protocol.cpp \
+    -pthread -o /tmp/omniscan-channel-tsan
+OMNISCAN_CHANNEL_STRESS_EXECUTABLE=/tmp/omniscan-channel-tsan \
+    TSAN_OPTIONS=halt_on_error=1 python3 -m pytest test/test_channel_stress.py -q
+```
+
+Replace `-fsanitize=thread` with `-fsanitize=address,undefined` to exercise the
+same TCP workers under memory/undefined-behavior checks. Keep leak detection
+enabled with `ASAN_OPTIONS=detect_leaks=1:halt_on_error=1`.
+
+The ROS lifecycle test also checks a resident-memory growth budget for the
+normal allocator. When testing an instrumented ROS executable, bound ASan's
+retained freed-allocation quarantine with
+`quarantine_size_mb=4:thread_local_quarantine_size_kb=64` in `ASAN_OPTIONS`;
+its default retention can otherwise exceed that budget without a leak report.
 
 ### Comparing runtime cost
 
